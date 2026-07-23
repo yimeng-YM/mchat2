@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent } from 'react'
 import { Check, RotateCcw, X } from 'lucide-react'
 import { useNativeBackDismiss } from './native-back'
 import { OverlayPortal } from './OverlayPortal'
@@ -89,6 +89,7 @@ export function AvatarCropper({ file, onCancel, onConfirm }: {
 
   const renderedWidth = imageInfo ? imageInfo.width * baseScale : STAGE_SIZE
   const renderedHeight = imageInfo ? imageInfo.height * baseScale : STAGE_SIZE
+  const zoomStyle = { '--range-progress': `${(zoom - 1) / 2 * 100}%` } as CSSProperties
 
   return <OverlayPortal><div className="crop-overlay" role="dialog" aria-modal="true" aria-labelledby="crop-title">
     <section className="crop-dialog">
@@ -112,7 +113,7 @@ export function AvatarCropper({ file, onCancel, onConfirm }: {
         />}
         <div className="crop-mask" />
       </div>
-      <div className="crop-zoom"><span>缩放</span><input type="range" min="1" max="3" step="0.01" value={zoom} onChange={event => changeZoom(Number(event.target.value))} aria-label="头像缩放" /><button onClick={() => { setZoom(1); setOffset({ x: 0, y: 0 }) }} aria-label="重置裁切"><RotateCcw /></button></div>
+      <div className="crop-zoom"><span>缩放</span><input className="range-input" style={zoomStyle} type="range" min="1" max="3" step="0.01" value={zoom} onChange={event => changeZoom(Number(event.target.value))} aria-label="头像缩放" /><button onClick={() => { setZoom(1); setOffset({ x: 0, y: 0 }) }} aria-label="重置裁切"><RotateCcw /></button></div>
       {error && <p className="crop-error">{error}</p>}
       <footer><button className="secondary" onClick={onCancel}>取消</button><button className="primary" onClick={confirm} disabled={!imageInfo || Boolean(error)}><Check />使用头像</button></footer>
     </section>

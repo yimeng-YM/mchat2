@@ -3,13 +3,16 @@ import { useRef } from 'react'
 import { Avatar } from './Avatar'
 import { ChatAttachmentView } from './ChatAttachmentView'
 import { ChatEmoji } from './ChatEmoji'
+import { UserAvatar } from './UserAvatar'
 import type { EmojiAsset } from './data-library'
 import type { Message, Role } from './chat-types'
 
-export function ChatMessage({ message, role, emoji, onEdit }: {
+export function ChatMessage({ message, role, emoji, userName, userAvatar, onEdit }: {
   message: Message
   role: Role
   emoji?: EmojiAsset
+  userName: string
+  userAvatar: string
   onEdit: (message: Message) => void
 }) {
   const longPressTimer = useRef<number | null>(null)
@@ -49,6 +52,6 @@ export function ChatMessage({ message, role, emoji, onEdit }: {
         <Pencil className="edit-hint" />
       </time>
     </div>
-    {message.from === 'me' && <div className="avatar avatar-sm my-avatar">你</div>}
+    {message.from === 'me' && <UserAvatar name={userName} avatar={userAvatar} size="sm" />}
   </div>
 }

@@ -179,7 +179,7 @@ export async function requestAiReply(
       max_tokens: maxTokens,
       messages: [
         { role: 'system', content: systemPrompt },
-        { role: 'system', content: `[???${formatConversationTime()}]` },
+        { role: 'system', content: `[当前时间：${formatConversationTime()}]` },
         ...conversation,
       ],
     },
@@ -189,7 +189,7 @@ export async function requestAiReply(
 
   if (response.status < 200 || response.status >= 300) {
     const detail = (response.data as { error?: { message?: string } })?.error?.message
-    throw new Error(detail || `?????HTTP ${response.status}?`)
+    throw new Error(detail || `模型请求失败（HTTP ${response.status}）`)
   }
   return responseText(response.data)
 }
@@ -208,17 +208,17 @@ export async function fetchModelList(config: ModelConfig) {
   }
   const payload = typeof response.data === 'string' ? JSON.parse(response.data) as unknown : response.data
   const rows = (payload as { data?: Array<{ id?: unknown }> })?.data
-  if (!Array.isArray(rows)) throw new Error('????????????')
+  if (!Array.isArray(rows)) throw new Error('模型服务返回了无法识别的列表格式')
   const models = [...new Set(rows.map(item => item.id).filter((id): id is string => typeof id === 'string' && Boolean(id.trim())))].sort()
-  if (!models.length) throw new Error('?????????')
+  if (!models.length) throw new Error('模型服务没有返回可用模型')
   return models
 }
 
 export async function testModelConnection(config: ModelConfig) {
   return requestAiReply(config, {
-    name: '??????',
+    name: '连接测试助手',
     signature: '',
-    persona: '???"????"?',
-  }, [{ from: 'me', text: '时间：时间：' }])
+    persona: '请只回复“连接正常”。',
+  }, [{ from: 'me', text: '请测试当前模型连接。' }])
 }
 

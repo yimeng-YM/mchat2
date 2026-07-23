@@ -16,6 +16,7 @@ export function ModelSettings() {
   const [memoryConfig, setMemoryConfig] = useState<MemoryModelConfig>(loadMemoryModelConfig)
   const [showMemoryModel, setShowMemoryModel] = useState(false)
   const [showMemoryKey, setShowMemoryKey] = useState(false)
+  const [memoryStatus, setMemoryStatus] = useState('')
 
   const update = <K extends keyof ModelConfig>(key: K, value: ModelConfig[K]) => {
     setConfig(current => ({ ...current, [key]: value }))
@@ -24,12 +25,12 @@ export function ModelSettings() {
 
   const updateMemoryConfig = <K extends keyof MemoryModelConfig>(key: K, value: MemoryModelConfig[K]) => {
     setMemoryConfig(current => ({ ...current, [key]: value }))
-    setStatus('')
+    setMemoryStatus('')
   }
 
   const saveMemoryModel = () => {
     saveMemoryModelConfig(memoryConfig)
-    setStatus('?????????')
+    setMemoryStatus('记忆模型设置已保存')
   }
 
   const save = () => {
@@ -68,6 +69,9 @@ export function ModelSettings() {
   }
 
   const temperatureStyle = { '--range-progress': `${config.temperature / 2 * 100}%` } as CSSProperties
+  const memoryTemperatureStyle = { '--range-progress': `${memoryConfig.temperature / 2 * 100}%` } as CSSProperties
+  const contextCountStyle = { '--range-progress': `${(config.contextMessageCount - 10) / 110 * 100}%` } as CSSProperties
+  const usesCustomMemoryModel = Boolean(memoryConfig.baseUrl.trim() || memoryConfig.apiKey.trim() || memoryConfig.model.trim())
 
   return <div className="model-settings">
     <section className="setting-group">
@@ -76,7 +80,7 @@ export function ModelSettings() {
         <label className="field wide"><span>请求地址</span><input value={config.baseUrl} onChange={event => update('baseUrl', event.target.value)} placeholder="https://api.openai.com/v1" /></label>
         <label className="field wide"><span>API Key</span><div className="secret-input"><input type={showKey ? 'text' : 'password'} value={config.apiKey} onChange={event => update('apiKey', event.target.value)} placeholder="sk-..." autoComplete="off" /><button type="button" onClick={() => setShowKey(value => !value)} aria-label={showKey ? '隐藏 API Key' : '显示 API Key'}>{showKey ? <EyeOff /> : <Eye />}</button></div></label>
         <div className="field wide"><label htmlFor="model-name">模型名称</label><div className="model-picker-row"><ModelPicker value={config.model} models={config.models} onChange={value => update('model', value)} /><button className="model-fetch-button" type="button" onClick={() => void loadModels()} disabled={fetchingModels}>{fetchingModels ? <LoaderCircle className="spin" /> : <ListRestart />}{config.models.length ? `更新列表 (${config.models.length})` : '获取模型列表'}</button></div></div>
-        <label className="field wide"><span>温度</span><div className="range-field"><input className="temperature-range" style={temperatureStyle} type="range" min="0" max="2" step="0.01" value={config.temperature} onChange={event => update('temperature', Number(event.target.value))} /><input className="temperature-value" type="number" min="0" max="2" step="0.01" value={config.temperature} onChange={event => update('temperature', Math.min(2, Math.max(0, Number(event.target.value))))} aria-label="温度数值" /></div></label>
+        <label className="field wide"><span>温度</span><div className="range-field"><input className="range-input temperature-range" style={temperatureStyle} type="range" min="0" max="2" step="0.01" value={config.temperature} onChange={event => update('temperature', Number(event.target.value))} /><input className="temperature-value" type="number" min="0" max="2" step="0.01" value={config.temperature} onChange={event => update('temperature', Math.min(2, Math.max(0, Number(event.target.value))))} aria-label="温度数值" /></div></label>
         <label className="field"><span>Max tokens</span><input type="number" min="1" max="128000" value={config.maxTokens} onChange={event => update('maxTokens', Number(event.target.value))} /></label>
       </div>
       <div className="model-actions">
@@ -87,21 +91,25 @@ export function ModelSettings() {
     </section>
 
     <section className="setting-group">
-      <h2>上下文消息数</h2>
-      <p>AI 回复时加载的最近消息数量（10-120条），影响上下文理解与记忆提取</p>
+      <div className="model-heading"><div><h2>上下文消息数</h2><p>同时用于聊天回复与长期记忆提取，数值越高会消耗更多上下文。</p></div><span>{config.contextMessageCount} 条</span></div>
       <div className="setting-row context-count-row">
         <MessageSquare />
-        <label className="setting-slider">
-          <input type="range" min="10" max="120" step="1" value={config.contextMessageCount}
+        <label className="context-count-control">
+          <span className="sr-only">上下文消息数</span>
+          <input className="range-input" style={contextCountStyle} type="range" min="10" max="120" step="1" value={config.contextMessageCount}
             onChange={event => update('contextMessageCount', Number(event.target.value))} />
-          <span>{config.contextMessageCount} 条</span>
+          <input type="number" min="10" max="120" step="1" value={config.contextMessageCount}
+            onChange={event => update('contextMessageCount', Math.max(10, Math.min(120, Math.round(Number(event.target.value) || 10))))}
+            aria-label="上下文消息数值" />
+          <span>条</span>
         </label>
       </div>
     </section>
 
     <section className="setting-group">
-      <button className="collapsible-header" onClick={() => setShowMemoryModel(v => !v)}>
-        <div><h2>记忆提取模型</h2><p>为空时使用聊天模型配置</p></div>
+      <button className="collapsible-header" onClick={() => setShowMemoryModel(value => !value)} aria-expanded={showMemoryModel}>
+        <div><h2>记忆提取模型</h2><p>可单独配置；独立配置中的空字段会继续继承聊天模型。</p></div>
+        <span className={`memory-model-mode ${usesCustomMemoryModel ? 'custom' : ''}`}>{usesCustomMemoryModel ? '独立模型' : '继承聊天模型'}</span>
         {showMemoryModel ? <ChevronUp /> : <ChevronDown />}
       </button>
       {showMemoryModel && <div className="model-form">
@@ -117,18 +125,20 @@ export function ModelSettings() {
             {showMemoryKey ? <EyeOff /> : <Eye />}
           </button>
         </div></label>
-        <label className="field wide"><span>模型名称</span><input value={memoryConfig.model}
-          onChange={event => updateMemoryConfig('model', event.target.value)}
-          placeholder="留空使用聊天模型" /></label>
+        <div className="field wide"><label>模型名称</label><ModelPicker value={memoryConfig.model} models={config.models} onChange={value => updateMemoryConfig('model', value)} /></div>
         <label className="field wide"><span>温度</span><div className="range-field">
-          <input className="temperature-range" type="range" min="0" max="2" step="0.01"
+          <input className="range-input temperature-range" style={memoryTemperatureStyle} type="range" min="0" max="2" step="0.01"
             value={memoryConfig.temperature}
             onChange={event => updateMemoryConfig('temperature', Number(event.target.value))} />
           <input className="temperature-value" type="number" min="0" max="2" step="0.01"
             value={memoryConfig.temperature}
-            onChange={event => updateMemoryConfig('temperature', Math.min(2, Math.max(0, Number(event.target.value))))} />
+            onChange={event => updateMemoryConfig('temperature', Math.min(2, Math.max(0, Number(event.target.value))))}
+            aria-label="记忆模型温度数值" />
         </div></label>
-        <button className="secondary" onClick={saveMemoryModel}><Save />保存记忆模型</button>
+        <div className="memory-model-actions">
+          <span className={memoryStatus ? 'success' : ''}>{memoryStatus && <CheckCircle2 />}{memoryStatus}</span>
+          <button className="secondary" onClick={saveMemoryModel}><Save />保存记忆模型</button>
+        </div>
       </div>}
     </section>
   </div>

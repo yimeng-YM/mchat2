@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { Camera, FolderOpen, Image, Save, Trash2, Wallpaper, X } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
+import {
+  Archive, ArchiveRestore, Camera, FolderOpen, Image, Pencil, Plus, Save, Star, Trash2, Wallpaper, X,
+} from 'lucide-react'
 import { AvatarCropper } from './AvatarCropper'
 import { BackgroundCropper } from './BackgroundCropper'
 import { ConfirmDialog } from './ConfirmDialog'
@@ -63,7 +65,12 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
   const [newMemoryImportance, setNewMemoryImportance] = useState(3)
   const [editingMemoryId, setEditingMemoryId] = useState<string | null>(null)
   const [editingMemoryText, setEditingMemoryText] = useState('')
+  const [editingMemoryCategory, setEditingMemoryCategory] = useState<Memory['category']>('other')
+  const [editingMemoryImportance, setEditingMemoryImportance] = useState(3)
   const [showMemoryForm, setShowMemoryForm] = useState(false)
+  const [memoryFilter, setMemoryFilter] = useState<'active' | 'all' | 'archived'>('active')
+  const [memoryToDelete, setMemoryToDelete] = useState<StoredMemory | null>(null)
+  const [clearMemoryConfirm, setClearMemoryConfirm] = useState(false)
   const emojiInput = useRef<HTMLInputElement>(null)
   const promptInput = useRef<HTMLInputElement>(null)
   const avatarInput = useRef<HTMLInputElement>(null)
@@ -136,7 +143,7 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
 
   const refreshMemories = useCallback(async () => {
     const items = await getMemoriesByRole(role.id)
-    setMemories(items)
+    setMemories(items.sort((a, b) => Number(Boolean(a.archived)) - Number(Boolean(b.archived)) || b.updatedAt - a.updatedAt))
   }, [role.id])
 
   useEffect(() => { void refreshMemories() }, [refreshMemories])
@@ -154,22 +161,55 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
   const startEditMemory = (memory: StoredMemory) => {
     setEditingMemoryId(memory.id)
     setEditingMemoryText(memory.content)
+    setEditingMemoryCategory(memory.category)
+    setEditingMemoryImportance(memory.importance)
   }
 
   const saveEditedMemory = async () => {
     if (!editingMemoryId) return
     const text = editingMemoryText.trim()
     if (!text) return
-    await updateMemory(editingMemoryId, { content: text })
+    await updateMemory(editingMemoryId, {
+      category: editingMemoryCategory,
+      content: text,
+      importance: editingMemoryImportance,
+    })
     setEditingMemoryId(null)
     setEditingMemoryText('')
     await refreshMemories()
   }
 
-  const removeMemory = async (id: string) => {
-    await deleteMemory(id)
+  const removeMemory = async () => {
+    if (!memoryToDelete) return
+    await deleteMemory(memoryToDelete.id)
+    setMemoryToDelete(null)
     await refreshMemories()
   }
+
+  const toggleMemoryArchive = async (memory: StoredMemory) => {
+    await updateMemory(memory.id, { archived: !memory.archived })
+    await refreshMemories()
+  }
+
+  const clearMemories = async () => {
+    await clearMemoriesByRole(role.id)
+    setClearMemoryConfirm(false)
+    await refreshMemories()
+  }
+
+  const activeMemoryCount = memories.filter(memory => !memory.archived).length
+  const archivedMemoryCount = memories.length - activeMemoryCount
+  const visibleMemories = memories.filter(memory => {
+    if (memoryFilter === 'active') return !memory.archived
+    if (memoryFilter === 'archived') return Boolean(memory.archived)
+    return true
+  })
+  const backgroundBlurStyle = {
+    '--range-progress': `${background ? background.blur / 20 * 100 : 0}%`,
+  } as CSSProperties
+  const backgroundOverlayStyle = {
+    '--range-progress': `${background ? background.overlay / 85 * 100 : 0}%`,
+  } as CSSProperties
 
   return <aside className="role-editor-panel">
     <header><div><span>角色编辑</span><small>直接影响当前对话</small></div><button className="icon-btn" onClick={onClose} aria-label="关闭角色编辑"><X /></button></header>
@@ -184,8 +224,8 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
         <div className="role-background-heading"><div><h3>聊天背景</h3><p>仅应用于当前角色</p></div><button className="secondary compact import-action" onClick={() => backgroundInput.current?.click()}><Wallpaper />{background?.image ? '更换背景' : '导入背景'}</button><input ref={backgroundInput} hidden type="file" accept="image/*" onChange={event => importBackground(event.target.files?.[0])} /></div>
         {background?.image ? <div className="background-editor">
           <div className="background-preview"><img src={background.image} alt="聊天背景预览" style={{ filter: `blur(${background.blur}px)`, transform: `scale(${1 + background.blur / 100})` }} /><i style={{ opacity: background.overlay / 100 }} /></div>
-          <label><span>模糊度</span><input type="range" min="0" max="20" step="1" value={background.blur} onChange={event => setBackground(current => current ? { ...current, blur: Number(event.target.value) } : current)} /><output>{background.blur}</output></label>
-          <label><span>遮罩强度</span><input type="range" min="0" max="85" step="1" value={background.overlay} onChange={event => setBackground(current => current ? { ...current, overlay: Number(event.target.value) } : current)} /><output>{background.overlay}%</output></label>
+          <label><span>模糊度</span><input className="range-input" style={backgroundBlurStyle} type="range" min="0" max="20" step="1" value={background.blur} onChange={event => setBackground(current => current ? { ...current, blur: Number(event.target.value) } : current)} /><output>{background.blur}</output></label>
+          <label><span>遮罩强度</span><input className="range-input" style={backgroundOverlayStyle} type="range" min="0" max="85" step="1" value={background.overlay} onChange={event => setBackground(current => current ? { ...current, overlay: Number(event.target.value) } : current)} /><output>{background.overlay}%</output></label>
           <button className="text-danger" onClick={() => setBackground(undefined)}><Trash2 />移除聊天背景</button>
         </div> : <button className="background-empty" onClick={() => backgroundInput.current?.click()}><Wallpaper /><span><strong>使用自定义聊天背景</strong><small>支持裁切、模糊和遮罩强度调整</small></span></button>}
       </section>
@@ -195,67 +235,87 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
         {emojiTotal > emojis.length && <button className="emoji-load-more secondary" onClick={() => setEmojiVisibleLimit(current => Math.min(emojiTotal, current + 60))}>加载更多（剩余 {(emojiTotal - emojis.length).toLocaleString()} 个）</button>}
       </section>
     
-<section className="role-memory-section">
-  <div className="role-memory-heading">
-    <div><h3>长期记忆</h3><p>{memories.length} 条</p></div>
-    <button className="secondary compact" onClick={() => setShowMemoryForm(v => !v)} disabled={busy}>+ 添加记忆</button>
-  </div>
-  {showMemoryForm && <div className="memory-add-form">
-    <div className="memory-form-row">
-      <select value={newMemoryCategory} onChange={e => setNewMemoryCategory(e.target.value as Memory["category"])}>
-        <option value="preference">偏好</option>
-        <option value="habit">习惯</option>
-        <option value="event">事件</option>
-        <option value="person">人际</option>
-        <option value="other">其他</option>
-      </select>
-      <div className="memory-importance-picker">
-        {[1,2,3,4,5].map(n => <button key={n} className={newMemoryImportance >= n ? 'on' : ''} onClick={() => setNewMemoryImportance(n)}>{n}</button>)}
-      </div>
-    </div>
-    <textarea rows={2} value={newMemoryContent} onChange={e => setNewMemoryContent(e.target.value)} placeholder="输入记忆内容..." />
-    <div className="memory-form-actions">
-      <button className="secondary compact" onClick={() => { setShowMemoryForm(false); setNewMemoryContent('') }}>取消</button>
-      <button className="primary compact" disabled={!newMemoryContent.trim()} onClick={() => void addMemory()}>保存</button>
-    </div>
-  </div>}
-  {memories.length > 0 ? <div className="memory-list">
-    {memories.map(memory => (
-      <article key={memory.id} className="memory-item">
-        {editingMemoryId === memory.id ? (
-          <div className="memory-edit-inline">
-            <textarea rows={2} value={editingMemoryText} onChange={e => setEditingMemoryText(e.target.value)} />
-            <div className="memory-edit-actions">
-              <button className="secondary compact" onClick={() => setEditingMemoryId(null)}>取消</button>
-              <button className="primary compact" onClick={() => void saveEditedMemory()}>保存</button>
-            </div>
+      <section className="role-memory-section">
+        <div className="role-memory-heading">
+          <div><h3>长期记忆</h3><p>{activeMemoryCount} 条活动记忆 · {archivedMemoryCount} 条已归档</p></div>
+          <button className="secondary compact" onClick={() => setShowMemoryForm(value => !value)} disabled={busy}><Plus />添加记忆</button>
+        </div>
+        <div className="memory-filter" aria-label="筛选长期记忆">
+          <button className={memoryFilter === 'active' ? 'active' : ''} onClick={() => setMemoryFilter('active')}>活动 {activeMemoryCount}</button>
+          <button className={memoryFilter === 'all' ? 'active' : ''} onClick={() => setMemoryFilter('all')}>全部 {memories.length}</button>
+          <button className={memoryFilter === 'archived' ? 'active' : ''} onClick={() => setMemoryFilter('archived')}>已归档 {archivedMemoryCount}</button>
+        </div>
+        {showMemoryForm && <div className="memory-add-form">
+          <div className="memory-form-row">
+            <label><span>分类</span><select value={newMemoryCategory} onChange={event => setNewMemoryCategory(event.target.value as Memory['category'])}>
+              <option value="preference">偏好</option>
+              <option value="habit">习惯</option>
+              <option value="event">事件</option>
+              <option value="person">人际</option>
+              <option value="other">其他</option>
+            </select></label>
+            <fieldset className="memory-importance-field">
+              <legend>重要性</legend>
+              <div className="memory-importance-picker">
+                {[1, 2, 3, 4, 5].map(level => <button type="button" key={level} className={newMemoryImportance >= level ? 'on' : ''} onClick={() => setNewMemoryImportance(level)} aria-label={`重要性 ${level} 级`}><Star /></button>)}
+              </div>
+            </fieldset>
           </div>
-        ) : (
-          <>
-            <div className="memory-header">
-              <span className="memory-category-badge" data-category={memory.category}>{{
-                "preference": "偏好", "habit": "习惯", "event": "事件",
-                "person": "人际", "other": "其他"
-              }[memory.category] || "其他"}</span>
-              <span className="memory-importance">{"star".repeat(memory.importance)}</span>
-            </div>
-            <p className="memory-content">{memory.content}</p>
-            <div className="memory-actions">
-              <button className="icon-btn" onClick={() => startEditMemory(memory)}>✏️</button>
-              <button className="icon-btn danger-hover" onClick={() => void removeMemory(memory.id)}>🗑️</button>
-            </div>
-          </>
-        )}
-      </article>
-    ))}
-  </div> : <div className="memory-empty">
-    <span><strong>暂无长期记忆</strong><small>AI 回复后会尝试自动提取</small></span>
-  </div>}
-</section>
+          <label className="memory-content-field"><span>记忆内容</span><textarea rows={3} value={newMemoryContent} onChange={event => setNewMemoryContent(event.target.value)} placeholder="例如：用户习惯在周末安排长距离跑步" /></label>
+          <div className="memory-form-actions">
+            <button className="secondary compact" onClick={() => { setShowMemoryForm(false); setNewMemoryContent('') }}>取消</button>
+            <button className="primary compact" disabled={!newMemoryContent.trim()} onClick={() => void addMemory()}>保存记忆</button>
+          </div>
+        </div>}
+        {visibleMemories.length > 0 ? <div className="memory-list">
+          {visibleMemories.map(memory => <article key={memory.id} className={`memory-item ${memory.archived ? 'archived' : ''}`}>
+            {editingMemoryId === memory.id ? <div className="memory-edit-inline">
+              <div className="memory-form-row">
+                <label><span>分类</span><select value={editingMemoryCategory} onChange={event => setEditingMemoryCategory(event.target.value as Memory['category'])}>
+                  <option value="preference">偏好</option>
+                  <option value="habit">习惯</option>
+                  <option value="event">事件</option>
+                  <option value="person">人际</option>
+                  <option value="other">其他</option>
+                </select></label>
+                <fieldset className="memory-importance-field">
+                  <legend>重要性</legend>
+                  <div className="memory-importance-picker">
+                    {[1, 2, 3, 4, 5].map(level => <button type="button" key={level} className={editingMemoryImportance >= level ? 'on' : ''} onClick={() => setEditingMemoryImportance(level)} aria-label={`重要性 ${level} 级`}><Star /></button>)}
+                  </div>
+                </fieldset>
+              </div>
+              <label className="memory-content-field"><span>记忆内容</span><textarea rows={3} value={editingMemoryText} onChange={event => setEditingMemoryText(event.target.value)} /></label>
+              <div className="memory-edit-actions">
+                <button className="secondary compact" onClick={() => setEditingMemoryId(null)}>取消</button>
+                <button className="primary compact" disabled={!editingMemoryText.trim()} onClick={() => void saveEditedMemory()}>保存修改</button>
+              </div>
+            </div> : <>
+              <div className="memory-header">
+                <div><span className="memory-category-badge" data-category={memory.category}>{{
+                  preference: '偏好', habit: '习惯', event: '事件', person: '人际', other: '其他',
+                }[memory.category]}</span>{memory.archived && <span className="memory-archive-badge">已归档</span>}</div>
+                <span className="memory-importance" aria-label={`重要性 ${memory.importance} 级`}><Star />{memory.importance}</span>
+              </div>
+              <p className="memory-content">{memory.content}</p>
+              <div className="memory-meta"><time>{new Date(memory.updatedAt).toLocaleDateString('zh-CN')}</time><div className="memory-actions">
+                <button className="icon-btn" onClick={() => startEditMemory(memory)} aria-label="编辑记忆"><Pencil /></button>
+                <button className="icon-btn" onClick={() => void toggleMemoryArchive(memory)} aria-label={memory.archived ? '恢复记忆' : '归档记忆'}>{memory.archived ? <ArchiveRestore /> : <Archive />}</button>
+                <button className="icon-btn danger-hover" onClick={() => setMemoryToDelete(memory)} aria-label="删除记忆"><Trash2 /></button>
+              </div></div>
+            </>}
+          </article>)}
+        </div> : <div className="memory-empty">
+          <Archive /><span><strong>{memories.length ? '当前筛选下没有记忆' : '暂无长期记忆'}</strong><small>{memories.length ? '切换筛选查看其他状态' : 'AI 回复后会按设置自动提取，也可以手动添加'}</small></span>
+        </div>}
+        {memories.length > 0 && <button className="memory-clear-action" onClick={() => setClearMemoryConfirm(true)}><Trash2 />清空该角色全部记忆</button>}
+      </section>
 </div>
     <footer><span>{!isNew && onDelete && <button className="delete-role-action" onClick={() => runViewTransition(() => setDeleteConfirm(true))}><Trash2 />删除角色</button>}</span><button className="primary" onClick={save}><Save />保存修改</button></footer>
     {cropFile && <AvatarCropper file={cropFile} onCancel={() => runViewTransition(() => setCropFile(null))} onConfirm={result => runViewTransition(() => { setAvatar(result); setCropFile(null); setNotice('头像已裁切，保存修改后生效') })} />}
     {backgroundCropFile && <BackgroundCropper file={backgroundCropFile} onCancel={() => runViewTransition(() => setBackgroundCropFile(null))} onConfirm={image => runViewTransition(() => { setBackground({ image, blur: background?.blur ?? 0, overlay: background?.overlay ?? 28 }); setBackgroundCropFile(null); setNotice('聊天背景已裁切，保存修改后生效') })} />}
     {deleteConfirm && <ConfirmDialog title={`删除「${name || role.name}」？`} description="角色、对话记录、表情包和附件都会从本机删除，此操作不可撤销。" confirmLabel="删除角色" destructive onCancel={() => setDeleteConfirm(false)} onConfirm={() => { setDeleteConfirm(false); void Promise.resolve(onDelete?.()).then(onClose) }} />}
+    {memoryToDelete && <ConfirmDialog title="删除这条长期记忆？" description="删除后无法恢复，之后的自动提取可能会根据新对话重新生成类似记忆。" confirmLabel="删除记忆" destructive onCancel={() => setMemoryToDelete(null)} onConfirm={() => void removeMemory()} />}
+    {clearMemoryConfirm && <ConfirmDialog title={`清空「${name || role.name}」的全部记忆？`} description={`将永久删除 ${memories.length} 条长期记忆，包括已归档内容。`} confirmLabel="清空全部记忆" destructive onCancel={() => setClearMemoryConfirm(false)} onConfirm={() => void clearMemories()} />}
   </aside>
 }

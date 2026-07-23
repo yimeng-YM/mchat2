@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent } from 'react'
 import { Check, RotateCcw, X } from 'lucide-react'
 import { useNativeBackDismiss } from './native-back'
 import { OverlayPortal } from './OverlayPortal'
@@ -38,6 +38,7 @@ export function BackgroundCropper({ file, onCancel, onConfirm }: {
     if (!imageInfo) return 1
     return Math.max(STAGE_WIDTH / imageInfo.width, STAGE_HEIGHT / imageInfo.height)
   }, [imageInfo])
+  const zoomStyle = { '--range-progress': `${(zoom - 1) / 2 * 100}%` } as CSSProperties
 
   const constrain = (point: Point, nextZoom = zoom) => {
     if (!imageInfo) return { x: 0, y: 0 }
@@ -96,7 +97,7 @@ export function BackgroundCropper({ file, onCancel, onConfirm }: {
         />}
         <div className="background-crop-guide" />
       </div>
-      <div className="crop-zoom"><span>缩放</span><input type="range" min="1" max="3" step="0.01" value={zoom} onChange={event => { const next = Number(event.target.value); setZoom(next); setOffset(current => constrain(current, next)) }} aria-label="背景缩放" /><button onClick={() => { setZoom(1); setOffset({ x: 0, y: 0 }) }} aria-label="重置背景裁切"><RotateCcw /></button></div>
+      <div className="crop-zoom"><span>缩放</span><input className="range-input" style={zoomStyle} type="range" min="1" max="3" step="0.01" value={zoom} onChange={event => { const next = Number(event.target.value); setZoom(next); setOffset(current => constrain(current, next)) }} aria-label="背景缩放" /><button onClick={() => { setZoom(1); setOffset({ x: 0, y: 0 }) }} aria-label="重置背景裁切"><RotateCcw /></button></div>
       <footer><button className="secondary" onClick={onCancel}>取消</button><button className="primary" onClick={confirm} disabled={!imageInfo}><Check />使用背景</button></footer>
     </section>
   </div></OverlayPortal>

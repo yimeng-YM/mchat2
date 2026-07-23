@@ -11,9 +11,12 @@ export type AppPreferences = {
   notificationsEnabled: boolean
   notificationPreview: boolean
   memoryExtractionInterval: number // 0 = 禁用, 3 = 每3轮对话提取一次
+  userName: string
+  userAvatar: string
 }
 
 const STORAGE_KEY = 'jinyu-app-preferences'
+export const MAX_MEMORY_EXTRACTION_INTERVAL = 20
 
 export const defaultAppPreferences: AppPreferences = {
   typingStatus: true,
@@ -21,6 +24,8 @@ export const defaultAppPreferences: AppPreferences = {
   notificationsEnabled: false,
   notificationPreview: true,
   memoryExtractionInterval: 3,
+  userName: '你',
+  userAvatar: '',
 }
 
 export function loadAppPreferences(): AppPreferences {
@@ -32,8 +37,12 @@ export function loadAppPreferences(): AppPreferences {
       notificationsEnabled: stored.notificationsEnabled ?? defaultAppPreferences.notificationsEnabled,
       notificationPreview: stored.notificationPreview ?? defaultAppPreferences.notificationPreview,
       memoryExtractionInterval: Number.isFinite(stored.memoryExtractionInterval)
-        ? Math.max(0, Math.min(50, Math.round(stored.memoryExtractionInterval!)))
+        ? Math.max(0, Math.min(MAX_MEMORY_EXTRACTION_INTERVAL, Math.round(stored.memoryExtractionInterval!)))
         : defaultAppPreferences.memoryExtractionInterval,
+      userName: typeof stored.userName === 'string' && stored.userName.trim()
+        ? stored.userName.trim().slice(0, 32)
+        : defaultAppPreferences.userName,
+      userAvatar: typeof stored.userAvatar === 'string' ? stored.userAvatar : defaultAppPreferences.userAvatar,
     }
   } catch {
     return defaultAppPreferences

@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type CSSProperties } from 'react'
 import { App as CapacitorApp } from '@capacitor/app'
 import type { PluginListenerHandle } from '@capacitor/core'
 import {
-  Bell, Bot, Database, MessageCircle, MessageSquareText, Moon, Palette, Plus, Search, Settings, Sun, X,
+  Bell, Bot, BrainCircuit, Database, MessageCircle, MessageSquareText, Moon, Palette, Plus, Search, Settings, Sun, X,
 } from 'lucide-react'
 import { Avatar } from './Avatar'
 import { ChatView } from './ChatView'
@@ -16,11 +16,13 @@ import {
   saveConversationMessages, updateConversationMessages,
 } from './data-library'
 import {
-  loadAppPreferences, saveAppPreferences, type AppPreferences,
+  loadAppPreferences, MAX_MEMORY_EXTRACTION_INTERVAL, saveAppPreferences, type AppPreferences,
 } from './preferences'
 import type { Message, Role } from './chat-types'
+import { resetConversationRoundCount } from './memory-service'
 import { dispatchNativeBackDismiss } from './native-back'
 import { runViewTransition } from './view-transitions'
+import { UserAvatar } from './UserAvatar'
 
 type Page = 'chat' | 'settings'
 
@@ -35,11 +37,13 @@ function lastMessage(messages?: Message[]) {
   return messages?.[messages.length - 1]
 }
 
-function Rail({ page, setPage, dark, setDark }: {
+function Rail({ page, setPage, dark, setDark, userName, userAvatar }: {
   page: Page
   setPage: (page: Page) => void
   dark: boolean
   setDark: (value: boolean) => void
+  userName: string
+  userAvatar: string
 }) {
   return <aside className="rail">
     <button className="brand" onClick={() => setPage('chat')} aria-label="近聊首页"><MessageCircle /></button>
@@ -49,7 +53,7 @@ function Rail({ page, setPage, dark, setDark }: {
     </nav>
     <div className="rail-bottom">
       <button onClick={() => setDark(!dark)} aria-label="切换主题">{dark ? <Sun /> : <Moon />}</button>
-      <div className="mini-me">??</div>
+      <UserAvatar name={userName} avatar={userAvatar} size="md" />
     </div>
   </aside>
 }
@@ -112,6 +116,11 @@ function SettingsPage({ dark, setDark, roles, preferences, setPreferences, onDat
   const [notificationNotice, setNotificationNotice] = useState('')
   const patchPreference = (changes: Partial<AppPreferences>) => setPreferences({ ...preferences, ...changes })
   const chooseSection = (next: typeof section) => setSection(next)
+  const memoryIntervalStyle = {
+    '--range-progress': `${preferences.memoryExtractionInterval > 0
+      ? (preferences.memoryExtractionInterval - 1) / (MAX_MEMORY_EXTRACTION_INTERVAL - 1) * 100
+      : 0}%`,
+  } as CSSProperties
 
   const setNotifications = async (enabled: boolean) => {
     setNotificationNotice('')
@@ -138,8 +147,8 @@ function SettingsPage({ dark, setDark, roles, preferences, setPreferences, onDat
       {section === 'appearance' && <section className="settings-content">
         <div className="setting-group"><h2>外观</h2><p>选择应用的显示方式。</p>
           <div className="theme-options">
-            <button className={!dark ? 'selected' : ''} onClick={() => setDark(false)}><div className="theme-preview light"><i /><span /><span /></div><strong><Sun />ǳɫ</strong></button>
-            <button className={dark ? 'selected' : ''} onClick={() => setDark(true)}><div className="theme-preview dark"><i /><span /><span /></div><strong>深色</strong></button>
+            <button className={!dark ? 'selected' : ''} onClick={() => setDark(false)}><div className="theme-preview light"><i /><span /><span /></div><strong><Sun />浅色</strong></button>
+            <button className={dark ? 'selected' : ''} onClick={() => setDark(true)}><div className="theme-preview dark"><i /><span /><span /></div><strong><Moon />深色</strong></button>
           </div>
         </div>
       </section>}
@@ -147,7 +156,7 @@ function SettingsPage({ dark, setDark, roles, preferences, setPreferences, onDat
         <div className="setting-group"><h2>聊天体验</h2>
           <div className="setting-row"><div><strong>显示“对方正在输入…”</strong><span>模型生成回复时在聊天顶部显示状态</span></div><Toggle label="显示对方正在输入" checked={preferences.typingStatus} onChange={v => setPreferences({...preferences, typingStatus: v})} /></div>
           <div className="setting-row"><div><strong>消息提示音</strong><span>发送和收到消息时播放轻提示音</span></div><Toggle label="消息提示音" checked={preferences.messageSound} onChange={v => setPreferences({...preferences, messageSound: v})} /></div>
-          <div className="setting-row"><div><strong>记忆提取间隔</strong><span>每几轮对话后自动提取记忆，设为 0 关闭</span></div><div className="setting-inline"><button className={`toggle ${preferences.memoryExtractionInterval > 0 ? 'on' : ''}`} onClick={() => setPreferences({...preferences, memoryExtractionInterval: preferences.memoryExtractionInterval > 0 ? 0 : 3})} aria-label="启用记忆提取" aria-pressed={preferences.memoryExtractionInterval > 0}><i /></button>{preferences.memoryExtractionInterval > 0 && <label className="setting-slider"><span>{preferences.memoryExtractionInterval}</span><input type="range" min="1" max="20" step="1" value={preferences.memoryExtractionInterval} onChange={event => setPreferences({...preferences, memoryExtractionInterval: Number(event.target.value)})} />轮</label>}</div></div>
+          <div className="setting-row memory-interval-row"><div className="setting-copy-with-icon"><BrainCircuit /><span><strong>记忆提取间隔</strong><small>按完整对话轮次自动整理长期记忆，关闭后不再自动提取</small></span></div><div className="setting-inline memory-interval-control"><button className={`toggle ${preferences.memoryExtractionInterval > 0 ? 'on' : ''}`} onClick={() => setPreferences({...preferences, memoryExtractionInterval: preferences.memoryExtractionInterval > 0 ? 0 : 3})} aria-label="启用记忆提取" aria-pressed={preferences.memoryExtractionInterval > 0}><i /></button>{preferences.memoryExtractionInterval > 0 && <label className="setting-slider"><span className="sr-only">记忆提取间隔</span><input className="range-input" style={memoryIntervalStyle} type="range" min="1" max={MAX_MEMORY_EXTRACTION_INTERVAL} step="1" value={preferences.memoryExtractionInterval} onChange={event => setPreferences({...preferences, memoryExtractionInterval: Number(event.target.value)})} /><output>{preferences.memoryExtractionInterval} 轮</output></label>}</div></div>
           <QueueSettings />
         </div>
       </section>}
@@ -159,7 +168,7 @@ function SettingsPage({ dark, setDark, roles, preferences, setPreferences, onDat
           {notificationNotice && <p className="setting-warning">{notificationNotice}</p>}
         </div>
       </section>}
-      {section === 'data' && <section className="settings-content"><div className="setting-group"><DataSettings roles={roles} onChanged={onDataChanged} /></div></section>}
+      {section === 'data' && <section className="settings-content"><DataSettings roles={roles} preferences={preferences} onPreferencesChange={setPreferences} onChanged={onDataChanged} /></section>}
       </div>
     </div>
   </main>
@@ -324,6 +333,7 @@ export default function App() {
   const deleteSelectedRole = async () => {
     if (!selectedRole) return
     await removeRoleData(selectedRole.id)
+    resetConversationRoundCount(selectedRole.id)
     const remaining = roles.filter(role => role.id !== selectedRole.id)
     runViewTransition(() => {
       setRoles(remaining)
@@ -371,7 +381,7 @@ export default function App() {
   const appClass = ['app', dark ? 'dark-mode' : '', page === 'chat' && !mobileConversations ? 'chat-open' : ''].filter(Boolean).join(' ')
 
   return <div className={appClass}>
-    <Rail page={page} setPage={navigate} dark={dark} setDark={setDark} />
+    <Rail page={page} setPage={navigate} dark={dark} setDark={setDark} userName={preferences.userName} userAvatar={preferences.userAvatar} />
     {page === 'chat' && <>
       <ConversationList
         roles={roles}

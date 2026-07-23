@@ -30,6 +30,12 @@ export type StoredMemory = {
   lastRoundAccessed?: number
 }
 
+export type MemoryStats = {
+  total: number
+  archived: number
+  byRole: Record<number, { total: number; archived: number }>
+}
+
 export type EmojiAsset = {
   id: string
   roleId: number
@@ -190,9 +196,10 @@ export async function trimConversation(roleId: number, keepRounds: number) {
 }
 
 export async function removeRoleData(roleId: number) {
-  await libraryDb.transaction('rw', libraryDb.messages, libraryDb.emojis, async () => {
+  await libraryDb.transaction('rw', libraryDb.messages, libraryDb.emojis, libraryDb.memories, async () => {
     await libraryDb.messages.where('roleId').equals(roleId).delete()
     if (!hasNativeMediaLibrary()) await libraryDb.emojis.where('roleId').equals(roleId).delete()
+    await libraryDb.memories.where('roleId').equals(roleId).delete()
   })
   if (hasNativeMediaLibrary()) await nativeMedia.removeRole({ roleId })
   await removeNativeRoleFiles(roleId)
@@ -200,9 +207,10 @@ export async function removeRoleData(roleId: number) {
 
 export async function removeLegacyDefaultData() {
   if (await libraryDb.meta.get('legacy-defaults-removed')) return
-  await libraryDb.transaction('rw', libraryDb.messages, libraryDb.emojis, libraryDb.meta, async () => {
+  await libraryDb.transaction('rw', libraryDb.messages, libraryDb.emojis, libraryDb.memories, libraryDb.meta, async () => {
     await libraryDb.messages.where('roleId').anyOf([1, 2, 3, 4]).delete()
     if (!hasNativeMediaLibrary()) await libraryDb.emojis.where('roleId').anyOf([1, 2, 3, 4]).delete()
+    await libraryDb.memories.where('roleId').anyOf([1, 2, 3, 4]).delete()
     await libraryDb.meta.put({ key: 'legacy-defaults-removed', value: new Date().toISOString() })
   })
   if (hasNativeMediaLibrary()) {
@@ -227,7 +235,7 @@ export async function inspectConversationArchive(file: File) {
     const item = JSON.parse(line) as Partial<StoredMessage> & { type?: string }
     if (item.type === 'jinyu-archive') return
     const roleId = Number(item.roleId)
-    if (!roleId || !item.text || (item.from !== 'me' && item.from !== 'them')) throw new Error('褰掓。涓寘鍚棤鏁堢殑瀵硅瘽璁板綍')
+    if (!roleId || !item.text || (item.from !== 'me' && item.from !== 'them')) throw new Error('归档中包含无效的对话记录')
     counts[roleId] = (counts[roleId] ?? 0) + 1
   }
   while (true) {
@@ -259,7 +267,7 @@ export async function importConversationArchive(file: File, onProgress: (progres
     const item = JSON.parse(line) as Partial<StoredMessage> & { type?: string }
     if (item.type === 'jinyu-archive') return
     scanned += 1
-    if (!item.roleId || !item.text || (item.from !== 'me' && item.from !== 'them')) throw new Error(`第?${scanned} 琛屼笉鏄湁鏁堢殑瀵硅瘽璁板綍`)
+    if (!item.roleId || !item.text || (item.from !== 'me' && item.from !== 'them')) throw new Error(`第 ${scanned} 行不是有效的对话记录`)
     if (selected && !selected.has(Number(item.roleId))) return
     const messageId = Number(item.messageId ?? Date.now() + processed)
     batch.push({
@@ -315,7 +323,7 @@ async function writeArchiveToStream(writer: WritableStreamDefaultWriter<Uint8Arr
 }
 
 export async function exportConversationArchive(selectedRoleIds?: number[]) {
-  const archiveName = `近语-瀵硅瘽璁板綍-${new Date().toISOString().slice(0, 10)}.ndjson`
+  const archiveName = `近语-对话记录-${new Date().toISOString().slice(0, 10)}.ndjson`
   if (hasNativeMediaLibrary()) {
     const { token } = await nativeMedia.beginTextExport({ name: archiveName })
     await nativeMedia.appendTextExport({ token, chunk: `${JSON.stringify({ type: 'jinyu-archive', version: 1 })}\n` })
@@ -333,7 +341,7 @@ export async function exportConversationArchive(selectedRoleIds?: number[]) {
   }
   const picker = (window as typeof window & { showSaveFilePicker?: (options: unknown) => Promise<{ createWritable: () => Promise<FileSystemWritableFileStream> }> }).showSaveFilePicker
   if (picker) {
-    const handle = await picker({ suggestedName: archiveName, types: [{ description: '杩戣瀵硅瘽褰掓。', accept: { 'application/x-ndjson': ['.ndjson'] } }] })
+    const handle = await picker({ suggestedName: archiveName, types: [{ description: '近语对话归档', accept: { 'application/x-ndjson': ['.ndjson'] } }] })
     const writable = await handle.createWritable()
     const writer = writable.getWriter()
     await writeArchiveToStream(writer, selectedRoleIds)
@@ -426,9 +434,9 @@ function exportFileName(item: EmojiAsset) {
 
 export async function exportEmojiPack(roleId: number, roleName: string) {
   const safeName = roleName.replace(/[\\/:*?"<>|]/g, '_')
-  if (hasNativeMediaLibrary()) return nativeMedia.exportRolePack({ roleId, name: `${safeName}-表情包?zip` })
+  if (hasNativeMediaLibrary()) return nativeMedia.exportRolePack({ roleId, name: `${safeName}-表情包.zip` })
   const directoryPicker = (window as typeof window & { showDirectoryPicker?: () => Promise<{ getDirectoryHandle: (name: string, options: { create: boolean }) => Promise<{ getFileHandle: (name: string, options: { create: boolean }) => Promise<{ createWritable: () => Promise<FileSystemWritableFileStream> }> }> }> }).showDirectoryPicker
-  if (!directoryPicker) throw new Error('褰撳墠娴忚鍣ㄤ笉鏀寔鐩綍瀵煎嚭锛岃浣跨敤鏈€鏂扮増 Chrome 鎴?Edge')
+  if (!directoryPicker) throw new Error('当前浏览器不支持目录导出，请使用最新版 Chrome 或 Edge')
   const root = await directoryPicker()
   const directory = await root.getDirectoryHandle(`${safeName}-表情包`, { create: true })
   let offset = 0
@@ -481,7 +489,10 @@ export async function saveMemory(roleId: number, memory: MemoryInput): Promise<S
   return storedMemory
 }
 
-export async function updateMemory(id: string, updates: Partial<MemoryInput>): Promise<StoredMemory | null> {
+export async function updateMemory(
+  id: string,
+  updates: Partial<Pick<StoredMemory, 'category' | 'content' | 'importance' | 'archived' | 'lastRoundAccessed'>>,
+): Promise<StoredMemory | null> {
   const existing = await libraryDb.memories.get(id)
   if (!existing) return null
   
@@ -518,10 +529,11 @@ export async function getImportantMemories(roleId: number, limit = 20): Promise<
   const all = await libraryDb.memories
     .where('[roleId+importance]')
     .between([roleId, 3], [roleId, 6])
-    .reverse()
-    .limit(limit * 2)
     .toArray()
-  return all.filter(m => !m.archived).slice(0, limit)
+  return all
+    .filter(memory => !memory.archived)
+    .sort((a, b) => b.importance - a.importance || b.updatedAt - a.updatedAt)
+    .slice(0, limit)
 }
 
 export async function searchMemories(roleId: number, query: string): Promise<StoredMemory[]> {
@@ -539,6 +551,22 @@ export async function clearMemoriesByRole(roleId: number): Promise<number> {
   return memories.length
 }
 
+export async function getMemoryStats(): Promise<MemoryStats> {
+  const memories = await libraryDb.memories.toArray()
+  const byRole: MemoryStats['byRole'] = {}
+  let archived = 0
+  for (const memory of memories) {
+    const roleStats = byRole[memory.roleId] ?? { total: 0, archived: 0 }
+    roleStats.total += 1
+    if (memory.archived) {
+      roleStats.archived += 1
+      archived += 1
+    }
+    byRole[memory.roleId] = roleStats
+  }
+  return { total: memories.length, archived, byRole }
+}
+
 export async function inspectMemoryArchive(file: File) {
   const reader = file.stream().getReader()
   const decoder = new TextDecoder()
@@ -550,7 +578,7 @@ export async function inspectMemoryArchive(file: File) {
     const item = JSON.parse(line) as Partial<StoredMemory> & { type?: string }
     if (item.type === 'jinyu-memory-archive') return
     const roleId = Number(item.roleId)
-    if (!roleId || !item.content || !item.category) throw new Error('Archive contains invalid memory data')
+    if (!roleId || !item.content || !item.category) throw new Error('归档中包含无效的长期记忆')
     counts[roleId] = (counts[roleId] ?? 0) + 1
   }
   while (true) {
@@ -574,6 +602,7 @@ export async function importMemoryArchive(file: File, onProgress: (p: ImportProg
   let bytes = 0
   let processed = 0
   let batch: StoredMemory[] = []
+  const categories: StoredMemory['category'][] = ['preference', 'habit', 'event', 'person', 'other']
 
   const consumeLine = async (rawLine: string) => {
     const line = rawLine.trim()
@@ -582,14 +611,20 @@ export async function importMemoryArchive(file: File, onProgress: (p: ImportProg
     if (item.type === 'jinyu-memory-archive') return
     if (!item.roleId || !item.content) return
     if (selected && !selected.has(Number(item.roleId))) return
+    const category = categories.includes(item.category as StoredMemory['category'])
+      ? item.category as StoredMemory['category']
+      : 'other'
+    const lastRoundAccessed = Number(item.lastRoundAccessed)
     batch.push({
       id: item.id ?? crypto.randomUUID(),
       roleId: Number(item.roleId),
-      category: (item.category ?? 'other') as StoredMemory['category'],
+      category,
       content: String(item.content),
       importance: Math.max(1, Math.min(5, Math.round(Number(item.importance ?? 3)))),
       createdAt: Number(item.createdAt ?? Date.now()),
       updatedAt: Number(item.updatedAt ?? Date.now()),
+      archived: Boolean(item.archived),
+      lastRoundAccessed: Number.isFinite(lastRoundAccessed) ? lastRoundAccessed : undefined,
     })
     processed += 1
     if (batch.length >= 100) {
@@ -616,7 +651,7 @@ export async function importMemoryArchive(file: File, onProgress: (p: ImportProg
 }
 
 export async function exportMemoryArchive(selectedRoleIds?: number[]) {
-  const archiveName = `MChat2-memory-${new Date().toISOString().slice(0, 10)}.ndjson`
+  const archiveName = `近语-长期记忆-${new Date().toISOString().slice(0, 10)}.ndjson`
   const selected = selectedRoleIds?.length ? new Set(selectedRoleIds) : null
   const chunks: BlobPart[] = [JSON.stringify({ type: "jinyu-memory-archive", version: 1 }) + "\n"]
   const allMemories = selected

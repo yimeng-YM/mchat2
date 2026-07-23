@@ -13,6 +13,7 @@ import {
   deduplicateAndSaveMemories,
   incrementConversationRound,
   shouldExtractMemory,
+  updateMemoryRoundAccess,
 } from './memory-service'
 import { playMessageTone, type AppPreferences } from './preferences'
 import type { ChatAttachment, Message, Role } from './chat-types'
@@ -175,9 +176,10 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
 
       // 记忆提取
       const roundCount = incrementConversationRound(role.id)
+      void updateMemoryRoundAccess(role.id, roundCount, loadedMemories.map(memory => memory.id))
       if (shouldExtractMemory(role.id, preferences.memoryExtractionInterval)) {
         // 提取记忆（不阻塞消息展示）
-        const recentMessages = sentHistory.slice(-10).concat(receivedMessages).map(message => ({
+        const recentMessages = sentHistory.slice(-config.contextMessageCount).concat(receivedMessages).map(message => ({
           from: message.from,
           text: message.text,
           kind: message.kind,
@@ -186,13 +188,11 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
           if (!mountedRef.current) return
           const { newMemories, memoryAdjustments, archiveIds } = output
           if (!newMemories.length && !memoryAdjustments.length && !archiveIds.length) return
-          const saved = await deduplicateAndSaveMemories(role.id, newMemories, memoryAdjustments, archiveIds)
-          if (saved > 0) {
-            const updated = await loadRelevantMemories(role.id)
-            if (mountedRef.current) {
-              setMemories(updated)
-              memoriesRef.current = updated
-            }
+          await deduplicateAndSaveMemories(role.id, newMemories, memoryAdjustments, archiveIds)
+          const updated = await loadRelevantMemories(role.id)
+          if (mountedRef.current) {
+            setMemories(updated)
+            memoriesRef.current = updated
           }
         })
       }
@@ -361,6 +361,8 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
         message={message}
         role={role}
         emoji={message.kind === 'emoji' ? emojiMap.get(message.text) : undefined}
+        userName={preferences.userName}
+        userAvatar={preferences.userAvatar}
         onEdit={openGroupEditor}
       />)}
       {!messages.length && <div className="empty-conversation"><MessageEmptyIcon /><strong>开始聊天</strong><span>你们的消息会保存在这台设备上</span></div>}
