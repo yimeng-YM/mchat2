@@ -1,0 +1,26 @@
+node_modules/
+dist/
+android-web/
+.gradle/
+android/.gradle/
+android/local.properties
+android/app/build/
+android/build/
+release/
+.dev-server.log
+.dev-server.err.log
+.preview-server.log
+.preview-server.err.log
+*.local
+# Codex workspace
+.codex/
+
+# TypeScript build info
+tsconfig.tsbuildinfo
+
+# Temporary debug files
+corrupted_lines.txt
+fix_*.py
+
+# macOS
+.DS_Store

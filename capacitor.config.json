@@ -1,0 +1,11 @@
+{
+  "appId": "com.mchat2.jinyu",
+  "appName": "MChat2",
+  "webDir": "android-web",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false
+  }
+}
