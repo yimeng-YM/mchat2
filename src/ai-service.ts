@@ -1,8 +1,38 @@
-import { CapacitorHttp } from '@capacitor/core'
+import { CapacitorHttp, type HttpResponse } from '@capacitor/core'
 import { buildChatSystemPrompt, formatConversationTime } from './chat-protocol'
+import { completeDebugRequest, recordDebugRequest } from './debug-log'
 import { getAttachmentImageDataUrl } from './device-features'
 import type { ChatAttachment } from './chat-types'
 import type { StoredMemory } from './data-library'
+
+type LoggedRequestOptions = Parameters<typeof CapacitorHttp.request>[0]
+
+// 统一入口发起 HTTP 请求，调试模式开启时记录原始请求与响应。
+async function loggedRequest(label: string, options: LoggedRequestOptions): Promise<HttpResponse> {
+  const startedAt = Date.now()
+  const recordId = recordDebugRequest({
+    label,
+    method: String(options.method ?? 'GET'),
+    url: String(options.url ?? ''),
+    requestHeaders: options.headers as Record<string, string> | undefined,
+    requestBody: options.data,
+  })
+  try {
+    const response = await CapacitorHttp.request(options)
+    completeDebugRequest(recordId, {
+      status: response.status,
+      responseBody: response.data,
+      durationMs: Date.now() - startedAt,
+    })
+    return response
+  } catch (error) {
+    completeDebugRequest(recordId, {
+      durationMs: Date.now() - startedAt,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    throw error
+  }
+}
 
 export type QueueMode = 'auto' | 'manual'
 
@@ -26,7 +56,7 @@ export type AiMessage = {
   attachment?: ChatAttachment
 }
 
-const STORAGE_KEY = 'jinyu-model-config'
+const STORAGE_KEY = 'mchat2-model-config'
 
 export const defaultModelConfig: ModelConfig = {
   baseUrl: 'https://api.openai.com/v1',
@@ -85,7 +115,7 @@ function authorizationHeaders(config: ModelConfig): Record<string, string> {
 }
 
 function responseText(data: unknown) {
-  const payload = data as {
+  const payload = (typeof data === 'string' ? JSON.parse(data) : data) as {
     error?: { message?: string } | string
     choices?: Array<{ message?: { content?: string | Array<{ type?: string; text?: string }> } }>
   }
@@ -159,14 +189,15 @@ export async function requestAiReply(
   history: AiMessage[],
   emojiNames: string[] = [],
   memories: StoredMemory[] = [],
+  userName = '',
 ) {
   if (!config.model.trim()) throw new Error('请先填写模型名称')
   const temperature = Number.isFinite(config.temperature) ? Math.min(2, Math.max(0, config.temperature)) : defaultModelConfig.temperature
   const maxTokens = Number.isFinite(config.maxTokens) ? Math.max(1, Math.round(config.maxTokens)) : defaultModelConfig.maxTokens
-  const systemPrompt = buildChatSystemPrompt(role, emojiNames, memories)
+  const systemPrompt = buildChatSystemPrompt(role, emojiNames, memories, userName)
   const conversation = await apiConversationHistory(history, config.contextMessageCount)
 
-  const response = await CapacitorHttp.request({
+  const response = await loggedRequest('聊天回复', {
     url: chatEndpoint(config.baseUrl),
     method: 'POST',
     headers: {
@@ -194,8 +225,55 @@ export async function requestAiReply(
   return responseText(response.data)
 }
 
+/**
+ * Request a machine-readable response without applying the chat role-play
+ * protocol. This is used by background jobs such as memory extraction.
+ */
+export async function requestStructuredAiReply(
+  config: ModelConfig,
+  systemPrompt: string,
+  history: AiMessage[],
+): Promise<string> {
+  if (!config.model.trim()) throw new Error('请先填写模型名称')
+  const temperature = Number.isFinite(config.temperature) ? Math.min(2, Math.max(0, config.temperature)) : defaultModelConfig.temperature
+  const maxTokens = Number.isFinite(config.maxTokens) ? Math.max(1, Math.round(config.maxTokens)) : defaultModelConfig.maxTokens
+  const conversation = history
+    .slice(-Math.max(1, Math.round(config.contextMessageCount)))
+    .map(message => ({
+      role: message.from === 'me' ? 'user' as const : 'assistant' as const,
+      content: serializedMessage(message),
+    }))
+    .filter(message => message.content.length > 0)
+
+  const response = await loggedRequest('结构化请求（记忆等）', {
+    url: chatEndpoint(config.baseUrl),
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...authorizationHeaders(config),
+    },
+    data: {
+      model: config.model.trim(),
+      temperature,
+      max_tokens: maxTokens,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...conversation,
+      ],
+    },
+    connectTimeout: 20_000,
+    readTimeout: 120_000,
+  })
+
+  if (response.status < 200 || response.status >= 300) {
+    const detail = (response.data as { error?: { message?: string } })?.error?.message
+    throw new Error(detail || `模型请求失败（HTTP ${response.status}）`)
+  }
+  return responseText(response.data)
+}
+
 export async function fetchModelList(config: ModelConfig) {
-  const response = await CapacitorHttp.request({
+  const response = await loggedRequest('获取模型列表', {
     url: modelsEndpoint(config.baseUrl),
     method: 'GET',
     headers: authorizationHeaders(config),

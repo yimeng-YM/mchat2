@@ -20,7 +20,7 @@ export type Role = {
 
 export type ChatAttachment = {
   id: string
-  kind: 'image' | 'file'
+  kind: 'image'
   name: string
   mime: string
   size: number
@@ -41,7 +41,9 @@ export type Message = {
   time: string
 }
 
-export type MemoryCategory = 'preference' | 'habit' | 'event' | 'person' | 'other'
+export const MEMORY_CATEGORIES = ['preference', 'habit', 'event', 'person', 'numeric', 'other'] as const
+
+export type MemoryCategory = (typeof MEMORY_CATEGORIES)[number]
 
 export type Memory = {
   id: string

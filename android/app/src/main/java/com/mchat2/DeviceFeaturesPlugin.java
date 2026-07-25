@@ -1,4 +1,4 @@
-package com.mchat2.jinyu;
+package com.mchat2;
 
 import android.Manifest;
 import android.app.Activity;
@@ -13,6 +13,7 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.net.Uri;
 import android.os.Build;
+import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.speech.RecognizerIntent;
 
@@ -47,15 +48,20 @@ import java.util.UUID;
     }
 )
 public class DeviceFeaturesPlugin extends Plugin {
-    private static final String NOTIFICATION_CHANNEL = "jinyu_replies";
+    private static final String NOTIFICATION_CHANNEL = "mchat2_replies";
 
     @PluginMethod
-    public void pickAttachment(PluginCall call) {
-        String kind = call.getString("kind", "file");
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("image".equals(kind) ? "image/*" : "*/*");
-        startActivityForResult(call, intent, "pickAttachmentResult");
+    public void pickImage(PluginCall call) {
+        Intent intent;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent = new Intent(MediaStore.ACTION_PICK_IMAGES);
+            intent.setType("image/*");
+        } else {
+            intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("image/*");
+        }
+        startActivityForResult(call, intent, "pickImageResult");
     }
 
     @PluginMethod
@@ -86,7 +92,7 @@ public class DeviceFeaturesPlugin extends Plugin {
     }
 
     @ActivityCallback
-    private void pickAttachmentResult(PluginCall call, ActivityResult result) {
+    private void pickImageResult(PluginCall call, ActivityResult result) {
         if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null || result.getData().getData() == null) {
             JSObject response = new JSObject();
             response.put("cancelled", true);
@@ -94,35 +100,35 @@ public class DeviceFeaturesPlugin extends Plugin {
             return;
         }
         long roleId = call.getLong("roleId", 0L);
-        String kind = call.getString("kind", "file");
+
         Uri source = result.getData().getData();
         getBridge().executeOnMainThread(() -> new Thread(() -> {
             try {
                 ContentResolver resolver = getContext().getContentResolver();
                 String name = displayName(resolver, source);
                 String mime = resolver.getType(source);
-                if (mime == null) mime = "application/octet-stream";
+                if (mime == null) mime = "image/jpeg";
                 File directory = new File(getContext().getFilesDir(), "chat-attachments/" + roleId);
                 if (!directory.exists() && !directory.mkdirs()) throw new IllegalStateException("无法创建附件目录");
                 String safeName = name.replaceAll("[^\\p{L}\\p{N}._-]", "_");
                 if (safeName.length() > 100) safeName = safeName.substring(safeName.length() - 100);
                 File destination = new File(directory, UUID.randomUUID() + "--" + safeName);
                 try (InputStream input = resolver.openInputStream(source); FileOutputStream output = new FileOutputStream(destination)) {
-                    if (input == null) throw new IllegalStateException("无法读取附件");
+                    if (input == null) throw new IllegalStateException("无法读取图片");
                     byte[] buffer = new byte[1024 * 1024];
                     int read;
                     while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
                 }
                 JSObject response = new JSObject();
                 response.put("id", destination.getName());
-                response.put("kind", "image".equals(kind) ? "image" : "file");
+                response.put("kind", "image");
                 response.put("name", name);
                 response.put("mime", mime);
                 response.put("size", destination.length());
                 response.put("uri", Uri.fromFile(destination).toString());
                 call.resolve(response);
             } catch (Exception error) {
-                call.reject("导入附件失败", error);
+                call.reject("导入图片失败", error);
             }
         }).start());
     }
@@ -172,6 +178,24 @@ public class DeviceFeaturesPlugin extends Plugin {
         call.resolve(response);
     }
 
+    // 由 roleId 生成稳定的通知 id，使同一角色的通知可被后续查看操作精准清除。
+    private static int notificationId(long roleId) {
+        return (int) ((roleId ^ (roleId >>> 32)) & 0x7fffffff);
+    }
+
+    @PluginMethod
+    public void clearNotifications(PluginCall call) {
+        NotificationManager manager = (NotificationManager) getContext().getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager == null) {
+            call.resolve();
+            return;
+        }
+        Long roleId = call.getLong("roleId");
+        if (roleId == null) manager.cancelAll();
+        else manager.cancel(notificationId(roleId));
+        call.resolve();
+    }
+
     @PluginMethod
     public void notify(PluginCall call) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && getPermissionState("notifications") != PermissionState.GRANTED) {
@@ -194,7 +218,7 @@ public class DeviceFeaturesPlugin extends Plugin {
         );
         NotificationCompat.Builder notification = new NotificationCompat.Builder(getContext(), NOTIFICATION_CHANNEL)
             .setSmallIcon(android.R.drawable.ic_dialog_email)
-            .setContentTitle(call.getString("title", "近语"))
+            .setContentTitle(call.getString("title", "MChat2"))
             .setContentText(call.getString("body", "收到一条新消息"))
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
@@ -202,7 +226,7 @@ public class DeviceFeaturesPlugin extends Plugin {
         String avatarDataUrl = call.getString("avatarDataUrl");
         Bitmap avatar = decodeDataUrlBitmap(avatarDataUrl);
         if (avatar != null) {
-            String title = call.getString("title", "近语");
+            String title = call.getString("title", "MChat2");
             String body = call.getString("body", "收到一条新消息");
             Person user = new Person.Builder().setName("你").build();
             Person sender = new Person.Builder()
@@ -215,7 +239,7 @@ public class DeviceFeaturesPlugin extends Plugin {
         } else {
             notification.setStyle(new NotificationCompat.BigTextStyle().bigText(call.getString("body", "收到一条新消息")));
         }
-        manager.notify((int) (System.currentTimeMillis() & 0x7fffffff), notification.build());
+        manager.notify(notificationId(call.getLong("roleId", 0L)), notification.build());
         call.resolve();
     }
 

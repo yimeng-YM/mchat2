@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
 import {
-  Archive, ArchiveRestore, Camera, FolderOpen, Image, Pencil, Plus, Save, Star, Trash2, Wallpaper, X,
+  Archive, ArchiveRestore, Camera, ChevronDown, FolderOpen, Image, Pencil, Plus, Save, Star, Trash2, Wallpaper, X,
 } from 'lucide-react'
 import { AvatarCropper } from './AvatarCropper'
+import { CategorySelect, MEMORY_CATEGORY_LABELS } from './CategorySelect'
 import { BackgroundCropper } from './BackgroundCropper'
 import { ConfirmDialog } from './ConfirmDialog'
 import {
@@ -54,6 +55,7 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
   const [emojiTotal, setEmojiTotal] = useState(0)
   const [emojiBytes, setEmojiBytes] = useState(0)
   const [emojiVisibleLimit, setEmojiVisibleLimit] = useState(60)
+  const [showEmojis, setShowEmojis] = useState(false)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState('')
   const [cropFile, setCropFile] = useState<File | null>(null)
@@ -230,9 +232,11 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
         </div> : <button className="background-empty" onClick={() => backgroundInput.current?.click()}><Wallpaper /><span><strong>使用自定义聊天背景</strong><small>支持裁切、模糊和遮罩强度调整</small></span></button>}
       </section>
 
-      <section className="role-emoji-section"><div className="role-emoji-heading"><div><h3>角色表情包</h3><p>{emojiTotal.toLocaleString()} 个 · {formatBytes(emojiBytes)}</p></div><button className="secondary compact import-action" onClick={() => nativeLibrary ? void importEmojis() : emojiInput.current?.click()} disabled={busy}><FolderOpen />导入图片 / ZIP</button><input ref={emojiInput} hidden type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp,.zip,application/zip" onChange={event => void importEmojis(Array.from(event.target.files ?? []))} /></div>
+      <section className="role-emoji-section"><div className="role-emoji-heading"><button type="button" className="collapsible-toggle" onClick={() => setShowEmojis(value => !value)} aria-expanded={showEmojis}><div><h3>角色表情包</h3><p>{emojiTotal.toLocaleString()} 个 · {formatBytes(emojiBytes)}</p></div><ChevronDown className={`collapse-chevron ${showEmojis ? 'open' : ''}`} /></button>{showEmojis && <button className="secondary compact import-action" onClick={() => nativeLibrary ? void importEmojis() : emojiInput.current?.click()} disabled={busy}><FolderOpen />导入图片 / ZIP</button>}<input ref={emojiInput} hidden type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp,.zip,application/zip" onChange={event => void importEmojis(Array.from(event.target.files ?? []))} /></div>
+        {showEmojis && <>
         {emojis.length ? <div className="role-emoji-grid">{emojis.map(item => <article key={item.id}><div className="emoji-image"><EmojiPreview item={item} /><button onClick={() => void deleteEmoji(item)} aria-label={`删除 ${item.name}`}><Trash2 /></button></div><input defaultValue={item.name} onBlur={event => void updateEmojiName(item, event.target.value)} aria-label={`${item.name}的表情名称`} /></article>)}</div> : <div className="emoji-import-empty"><Image /><span><strong>还没有角色表情</strong><small>可导入图片或 ZIP 压缩包，名称自动取自文件名</small></span></div>}
         {emojiTotal > emojis.length && <button className="emoji-load-more secondary" onClick={() => setEmojiVisibleLimit(current => Math.min(emojiTotal, current + 60))}>加载更多（剩余 {(emojiTotal - emojis.length).toLocaleString()} 个）</button>}
+        </>}
       </section>
     
       <section className="role-memory-section">
@@ -247,13 +251,7 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
         </div>
         {showMemoryForm && <div className="memory-add-form">
           <div className="memory-form-row">
-            <label><span>分类</span><select value={newMemoryCategory} onChange={event => setNewMemoryCategory(event.target.value as Memory['category'])}>
-              <option value="preference">偏好</option>
-              <option value="habit">习惯</option>
-              <option value="event">事件</option>
-              <option value="person">人际</option>
-              <option value="other">其他</option>
-            </select></label>
+            <label><span>分类</span><CategorySelect value={newMemoryCategory} onChange={setNewMemoryCategory} /></label>
             <fieldset className="memory-importance-field">
               <legend>重要性</legend>
               <div className="memory-importance-picker">
@@ -271,13 +269,7 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
           {visibleMemories.map(memory => <article key={memory.id} className={`memory-item ${memory.archived ? 'archived' : ''}`}>
             {editingMemoryId === memory.id ? <div className="memory-edit-inline">
               <div className="memory-form-row">
-                <label><span>分类</span><select value={editingMemoryCategory} onChange={event => setEditingMemoryCategory(event.target.value as Memory['category'])}>
-                  <option value="preference">偏好</option>
-                  <option value="habit">习惯</option>
-                  <option value="event">事件</option>
-                  <option value="person">人际</option>
-                  <option value="other">其他</option>
-                </select></label>
+                <label><span>分类</span><CategorySelect value={editingMemoryCategory} onChange={setEditingMemoryCategory} /></label>
                 <fieldset className="memory-importance-field">
                   <legend>重要性</legend>
                   <div className="memory-importance-picker">
@@ -292,9 +284,7 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
               </div>
             </div> : <>
               <div className="memory-header">
-                <div><span className="memory-category-badge" data-category={memory.category}>{{
-                  preference: '偏好', habit: '习惯', event: '事件', person: '人际', other: '其他',
-                }[memory.category]}</span>{memory.archived && <span className="memory-archive-badge">已归档</span>}</div>
+                <div><span className="memory-category-badge" data-category={memory.category}>{MEMORY_CATEGORY_LABELS[memory.category]}</span>{memory.archived && <span className="memory-archive-badge">已归档</span>}</div>
                 <span className="memory-importance" aria-label={`重要性 ${memory.importance} 级`}><Star />{memory.importance}</span>
               </div>
               <p className="memory-content">{memory.content}</p>

@@ -1,4 +1,4 @@
-package com.mchat2.jinyu;
+package com.mchat2;
 
 import android.os.Bundle;
 import com.getcapacitor.BridgeActivity;

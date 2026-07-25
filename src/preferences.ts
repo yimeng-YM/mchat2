@@ -15,7 +15,7 @@ export type AppPreferences = {
   userAvatar: string
 }
 
-const STORAGE_KEY = 'jinyu-app-preferences'
+const STORAGE_KEY = 'mchat2-app-preferences'
 export const MAX_MEMORY_EXTRACTION_INTERVAL = 20
 
 export const defaultAppPreferences: AppPreferences = {
@@ -53,7 +53,7 @@ export function saveAppPreferences(preferences: AppPreferences) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(preferences))
 }
 
-const MEMORY_MODEL_KEY = 'jinyu-memory-model-config'
+const MEMORY_MODEL_KEY = 'mchat2-memory-model-config'
 
 export const defaultMemoryModelConfig: MemoryModelConfig = {
   baseUrl: '',

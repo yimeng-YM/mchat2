@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
-import { FileText, Image as ImageIcon, X } from 'lucide-react'
-import { formatBytes } from './data-library'
+import { Image as ImageIcon, X } from 'lucide-react'
 import { useNativeBackDismiss } from './native-back'
 import { OverlayPortal } from './OverlayPortal'
 import type { ChatAttachment } from './chat-types'
@@ -22,8 +21,7 @@ export function ChatAttachmentView({ attachment }: { attachment?: ChatAttachment
   }, [attachment])
 
   if (!attachment) return null
-  if (attachment.kind === 'image') {
-    return <>
+  return <>
       <button
         className="chat-image-attachment"
         onPointerDown={event => event.stopPropagation()}
@@ -44,9 +42,4 @@ export function ChatAttachmentView({ attachment }: { attachment?: ChatAttachment
         <img src={src} alt={attachment.name} onClick={event => event.stopPropagation()} />
       </div></OverlayPortal>}
     </>
-  }
-  return <div className="chat-file-attachment">
-    <FileText />
-    <span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size)}</small></span>
-  </div>
 }

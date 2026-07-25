@@ -1,5 +1,6 @@
-import { requestAiReply } from './ai-service'
+import { requestStructuredAiReply } from './ai-service'
 import type { AiMessage, ModelConfig } from './ai-service'
+import { MEMORY_CATEGORIES } from './chat-types'
 import type { ExtractionOutput, MemoryAdjustment, MemoryCategory, MemoryInput } from './chat-types'
 import {
   getImportantMemories,
@@ -11,19 +12,25 @@ import {
 } from './data-library'
 import { loadMemoryModelConfig } from './preferences'
 
-const MEMORY_EXTRACTION_SYSTEM_PROMPT = `你是长期记忆维护器。请根据最新对话和已有记忆，维护关于用户的稳定、可复用信息。
+/** 以角色第一人称视角构建记忆维护提示词，注入角色设定。 */
+function buildMemoryExtractionSystemPrompt(role: { name: string; persona: string }): string {
+  const personaSection = role.persona.trim()
+    ? `你的角色设定如下，请始终以这个身份来观察、记忆和表达：\n${role.persona.trim()}\n\n`
+    : ''
+  return `你正在扮演"${role.name}"。这是你在私聊中记录对方（用户）的长期记忆。请以你（${role.name}）的第一人称视角，维护关于对方的稳定、可复用信息。
 
-规则：
-1. 只记录未来对话中仍有帮助的信息，例如长期偏好、习惯、重要经历、持续关系和明确计划。
-2. 不记录寒暄、临时情绪、一次性请求、模型自己的回复，或无法从对话确认的推测。
-3. 新记忆应简洁、独立、以用户为主体，避免重复已有内容。
-4. 已有记忆被加强或削弱时，可调整重要性；明确过时、冲突或不再有效时可归档。
-5. 不要直接修改或归档不属于当前角色的记忆。
+${personaSection}规则：
+1. 始终用第一人称"我"来写，把用户称为"对方""ta"或其名字，就像你在自己的记事本里记下关于ta的事，可以带上你作为"${role.name}"对这件事的感受或态度。
+2. 只记录未来聊天中仍然有用的信息，例如对方的长期偏好、习惯、重要经历、持续的关系，以及明确的数值信息（年龄、生日、纪念日、数量、金额等）。
+3. 不记录寒暄、临时情绪、一次性请求、你自己说过的话，或无法从对话确认的猜测。
+4. 每条新记忆要简洁、独立，避免与已有记忆重复。
+5. 已有记忆被加强或削弱时可调整重要性；明确过时、冲突或不再成立时可归档。
+6. 不要修改或归档不属于当前角色的记忆。
 
 只返回合法 JSON，不要使用 Markdown 代码块或附加说明：
 {
   "newMemories": [
-    {"category":"preference|habit|event|person|other","content":"10-80字的记忆内容","importance":1-5}
+    {"category":"preference|habit|event|person|numeric|other","content":"10-80字、以你第一人称写的记忆","importance":1-5}
   ],
   "memoryAdjustments": [
     {"memoryId":"已有记忆ID","newImportance":1-5,"reason":"调整原因"}
@@ -31,9 +38,11 @@ const MEMORY_EXTRACTION_SYSTEM_PROMPT = `你是长期记忆维护器。请根据
   "archiveIds": ["需要归档的已有记忆ID"]
 }
 
+- category：preference=偏好，habit=习惯，event=事件，person=人际，numeric=数值信息（年龄/日期/数量/金额等具体数字），other=其他。
 - importance：1=弱相关，2=一般，3=重要，4=很重要，5=核心信息。
 - 没有对应操作时，数组必须为空。
 `
+}
 
 export type ExtractionResult = {
   category: MemoryCategory
@@ -70,6 +79,7 @@ export async function extractMemoriesFromConversation(
   const memoryConfig = resolveMemoryModelConfig(config)
   if (!memoryConfig.model.trim()) return { newMemories: [], memoryAdjustments: [], archiveIds: [] }
 
+  const systemPrompt = buildMemoryExtractionSystemPrompt(role)
   const existingMemories = await getMemoriesByRole(roleId)
   const existingMemoriesText = existingMemories.length > 0
     ? existingMemories
@@ -79,32 +89,38 @@ export async function extractMemoriesFromConversation(
 
   const conversationLimit = Math.max(1, memoryConfig.contextMessageCount - 2)
   const contextMessages: AiMessage[] = [
-    { from: 'me', text: `以下内容用于维护角色「${role.name}」对应的用户长期记忆。` },
+    { from: 'me', text: `以下内容用于维护你（${role.name}）记录的、关于对方的长期记忆。` },
     { from: 'me', text: `已有记忆：\n${existingMemoriesText}` },
     ...recentConversation.slice(-conversationLimit),
   ]
 
   try {
-    const reply = await requestAiReply(
-      memoryConfig,
-      { name: '长期记忆整理器', signature: '', persona: MEMORY_EXTRACTION_SYSTEM_PROMPT },
-      contextMessages,
-      [],
-    )
-    const cleaned = reply.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim()
-    const parsed = JSON.parse(cleaned) as unknown
-
-    if (typeof parsed !== 'object' || parsed === null) {
-      return { newMemories: [], memoryAdjustments: [], archiveIds: [] }
+    const reply = await requestStructuredAiReply(memoryConfig, systemPrompt, contextMessages)
+    let result: Partial<ExtractionOutput>
+    try {
+      result = parseExtractionObject(reply)
+    } catch (firstError) {
+      console.warn('记忆模型首次输出无法解析，正在自动纠正', firstError)
+      const retryReply = await requestStructuredAiReply(
+        { ...memoryConfig, temperature: 0 },
+        `${systemPrompt}\n这是格式纠错重试。必须直接输出一个 JSON 对象，首字符为 {，末字符为 }。不要输出思考过程、XML 标签、Markdown 或解释。`,
+        [
+          ...contextMessages,
+          { from: 'me', text: '上一轮输出格式不合格。请重新完成记忆维护，并严格按指定 JSON 对象格式返回。' },
+        ],
+      )
+      try {
+        result = parseExtractionObject(retryReply)
+      } catch {
+        throw new Error('记忆模型连续两次未返回可识别的 JSON，请更换支持结构化输出的记忆模型')
+      }
     }
-
-    const result = parsed as Partial<ExtractionOutput>
     const newMemories: MemoryInput[] = Array.isArray(result.newMemories)
       ? result.newMemories.filter(
           (item): item is MemoryInput =>
             typeof item === 'object' && item !== null &&
             typeof item.content === 'string' &&
-            ['preference', 'habit', 'event', 'person', 'other'].includes(item.category) &&
+            (MEMORY_CATEGORIES as readonly string[]).includes(item.category) &&
             typeof item.importance === 'number' && item.importance >= 1 && item.importance <= 5,
         )
       : []
@@ -138,10 +154,83 @@ export async function extractMemoriesFromConversation(
     }
   } catch (error) {
     console.warn('长期记忆提取失败', error)
-    return { newMemories: [], memoryAdjustments: [], archiveIds: [] }
+    throw error
   }
 }
 
+function balancedJsonObjects(value: string): string[] {
+  const candidates: string[] = []
+  let start = -1
+  let depth = 0
+  let inString = false
+  let escaped = false
+
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (character === '\\') escaped = true
+      else if (character === '"') inString = false
+      continue
+    }
+    if (character === '"') {
+      inString = true
+      continue
+    }
+    if (character === '{') {
+      if (depth === 0) start = index
+      depth += 1
+    } else if (character === '}' && depth > 0) {
+      depth -= 1
+      if (depth === 0 && start >= 0) {
+        candidates.push(value.slice(start, index + 1))
+        start = -1
+      }
+    }
+  }
+  return candidates
+}
+
+function unwrapJsonObject(value: unknown, depth = 0): Record<string, unknown> | null {
+  if (depth > 3) return null
+  if (typeof value === 'string') {
+    try {
+      return unwrapJsonObject(JSON.parse(value), depth + 1)
+    } catch {
+      return null
+    }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const object = value as Record<string, unknown>
+  if (['newMemories', 'memoryAdjustments', 'archiveIds'].some(key => key in object)) return object
+  for (const key of ['result', 'data', 'json', 'content', 'output']) {
+    if (key in object) {
+      const nested = unwrapJsonObject(object[key], depth + 1)
+      if (nested) return nested
+    }
+  }
+  return null
+}
+
+function parseExtractionObject(reply: string): Partial<ExtractionOutput> {
+  const cleaned = reply
+    .replace(/^\uFEFF/, '')
+    .replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, ' ')
+    .replace(/<analysis\b[^>]*>[\s\S]*?<\/analysis>/gi, ' ')
+    .trim()
+  const fenced = [...cleaned.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map(match => match[1].trim())
+  const candidates = [cleaned, ...fenced, ...balancedJsonObjects(cleaned).reverse()]
+
+  for (const candidate of [...new Set(candidates)].filter(Boolean)) {
+    try {
+      const object = unwrapJsonObject(JSON.parse(candidate))
+      if (object) return object as Partial<ExtractionOutput>
+    } catch {
+      // Continue through fenced and balanced candidates.
+    }
+  }
+  throw new Error('记忆模型没有返回可识别的 JSON 对象')
+}
 function memoryTokens(content: string) {
   return new Set(content.toLowerCase().split(/[\s\p{P}\p{S}]+/u).filter(Boolean))
 }
@@ -217,7 +306,7 @@ export async function loadRelevantMemories(roleId: number): Promise<StoredMemory
   return getImportantMemories(roleId, 20)
 }
 
-const ROUND_COUNTS_KEY = 'jinyu-memory-round-counts'
+const ROUND_COUNTS_KEY = 'mchat2-memory-round-counts'
 
 function loadConversationRoundCounts() {
   try {

@@ -1,6 +1,7 @@
 ﻿import Dexie, { type EntityTable } from 'dexie'
 import { Capacitor, registerPlugin } from '@capacitor/core'
 import { removeNativeRoleFiles } from './device-features'
+import { MEMORY_CATEGORIES } from './chat-types'
 import type { ChatAttachment, Message, Memory, MemoryInput } from './chat-types'
 
 export type StoredMessage = {
@@ -51,14 +52,14 @@ export type EmojiAsset = {
 
 export type ImportProgress = { processed: number; total: number; bytes?: number }
 
-class JinyuDatabase extends Dexie {
+class Mchat2Database extends Dexie {
   messages!: EntityTable<StoredMessage, 'key'>
   emojis!: EntityTable<EmojiAsset, 'id'>
   meta!: EntityTable<{ key: string; value: string }, 'key'>
   memories!: EntityTable<StoredMemory, 'id'>
 
   constructor() {
-    super('jinyu-library')
+    super('mchat2-library')
     this.version(1).stores({
       messages: '&key,roleId,createdAt,[roleId+createdAt]',
       emojis: '&id,roleId,createdAt,[roleId+createdAt],name',
@@ -70,7 +71,7 @@ class JinyuDatabase extends Dexie {
   }
 }
 
-export const libraryDb = new JinyuDatabase()
+export const libraryDb = new Mchat2Database()
 
 type NativeEmojiPage = { items: EmojiAsset[]; total: number; totalBytes: number }
 type NativeImportResult = { imported: number; failed: number; message?: string }
@@ -233,7 +234,7 @@ export async function inspectConversationArchive(file: File) {
     const line = rawLine.trim()
     if (!line) return
     const item = JSON.parse(line) as Partial<StoredMessage> & { type?: string }
-    if (item.type === 'jinyu-archive') return
+    if (item.type === 'mchat2-archive') return
     const roleId = Number(item.roleId)
     if (!roleId || !item.text || (item.from !== 'me' && item.from !== 'them')) throw new Error('归档中包含无效的对话记录')
     counts[roleId] = (counts[roleId] ?? 0) + 1
@@ -265,7 +266,7 @@ export async function importConversationArchive(file: File, onProgress: (progres
     const line = rawLine.trim()
     if (!line) return
     const item = JSON.parse(line) as Partial<StoredMessage> & { type?: string }
-    if (item.type === 'jinyu-archive') return
+    if (item.type === 'mchat2-archive') return
     scanned += 1
     if (!item.roleId || !item.text || (item.from !== 'me' && item.from !== 'them')) throw new Error(`第 ${scanned} 行不是有效的对话记录`)
     if (selected && !selected.has(Number(item.roleId))) return
@@ -311,7 +312,7 @@ export async function importConversationArchive(file: File, onProgress: (progres
 async function writeArchiveToStream(writer: WritableStreamDefaultWriter<Uint8Array>, selectedRoleIds?: number[]) {
   const encoder = new TextEncoder()
   const selected = selectedRoleIds?.length ? new Set(selectedRoleIds) : null
-  await writer.write(encoder.encode(`${JSON.stringify({ type: 'jinyu-archive', version: 1 })}\n`))
+  await writer.write(encoder.encode(`${JSON.stringify({ type: 'mchat2-archive', version: 1 })}\n`))
   let offset = 0
   while (true) {
     const rows = await libraryDb.messages.orderBy('createdAt').offset(offset).limit(500).toArray()
@@ -323,10 +324,10 @@ async function writeArchiveToStream(writer: WritableStreamDefaultWriter<Uint8Arr
 }
 
 export async function exportConversationArchive(selectedRoleIds?: number[]) {
-  const archiveName = `近语-对话记录-${new Date().toISOString().slice(0, 10)}.ndjson`
+  const archiveName = `MChat2-对话记录-${new Date().toISOString().slice(0, 10)}.ndjson`
   if (hasNativeMediaLibrary()) {
     const { token } = await nativeMedia.beginTextExport({ name: archiveName })
-    await nativeMedia.appendTextExport({ token, chunk: `${JSON.stringify({ type: 'jinyu-archive', version: 1 })}\n` })
+    await nativeMedia.appendTextExport({ token, chunk: `${JSON.stringify({ type: 'mchat2-archive', version: 1 })}\n` })
     let offset = 0
     while (true) {
       const rows = await libraryDb.messages.orderBy('createdAt').offset(offset).limit(500).toArray()
@@ -341,7 +342,7 @@ export async function exportConversationArchive(selectedRoleIds?: number[]) {
   }
   const picker = (window as typeof window & { showSaveFilePicker?: (options: unknown) => Promise<{ createWritable: () => Promise<FileSystemWritableFileStream> }> }).showSaveFilePicker
   if (picker) {
-    const handle = await picker({ suggestedName: archiveName, types: [{ description: '近语对话归档', accept: { 'application/x-ndjson': ['.ndjson'] } }] })
+    const handle = await picker({ suggestedName: archiveName, types: [{ description: 'MChat2 对话归档', accept: { 'application/x-ndjson': ['.ndjson'] } }] })
     const writable = await handle.createWritable()
     const writer = writable.getWriter()
     await writeArchiveToStream(writer, selectedRoleIds)
@@ -349,7 +350,7 @@ export async function exportConversationArchive(selectedRoleIds?: number[]) {
     return
   }
 
-  const chunks: BlobPart[] = [`${JSON.stringify({ type: 'jinyu-archive', version: 1 })}\n`]
+  const chunks: BlobPart[] = [`${JSON.stringify({ type: 'mchat2-archive', version: 1 })}\n`]
   const selected = selectedRoleIds?.length ? new Set(selectedRoleIds) : null
   await libraryDb.messages.orderBy('createdAt').each(row => { if (!selected || selected.has(row.roleId)) chunks.push(`${JSON.stringify(row)}\n`) })
   const url = URL.createObjectURL(new Blob(chunks, { type: 'application/x-ndjson' }))
@@ -576,7 +577,7 @@ export async function inspectMemoryArchive(file: File) {
     const line = rawLine.trim()
     if (!line) return
     const item = JSON.parse(line) as Partial<StoredMemory> & { type?: string }
-    if (item.type === 'jinyu-memory-archive') return
+    if (item.type === 'mchat2-memory-archive') return
     const roleId = Number(item.roleId)
     if (!roleId || !item.content || !item.category) throw new Error('归档中包含无效的长期记忆')
     counts[roleId] = (counts[roleId] ?? 0) + 1
@@ -602,13 +603,13 @@ export async function importMemoryArchive(file: File, onProgress: (p: ImportProg
   let bytes = 0
   let processed = 0
   let batch: StoredMemory[] = []
-  const categories: StoredMemory['category'][] = ['preference', 'habit', 'event', 'person', 'other']
+  const categories: readonly StoredMemory['category'][] = MEMORY_CATEGORIES
 
   const consumeLine = async (rawLine: string) => {
     const line = rawLine.trim()
     if (!line) return
     const item = JSON.parse(line) as Partial<StoredMemory> & { type?: string }
-    if (item.type === 'jinyu-memory-archive') return
+    if (item.type === 'mchat2-memory-archive') return
     if (!item.roleId || !item.content) return
     if (selected && !selected.has(Number(item.roleId))) return
     const category = categories.includes(item.category as StoredMemory['category'])
@@ -651,9 +652,9 @@ export async function importMemoryArchive(file: File, onProgress: (p: ImportProg
 }
 
 export async function exportMemoryArchive(selectedRoleIds?: number[]) {
-  const archiveName = `近语-长期记忆-${new Date().toISOString().slice(0, 10)}.ndjson`
+  const archiveName = `MChat2-长期记忆-${new Date().toISOString().slice(0, 10)}.ndjson`
   const selected = selectedRoleIds?.length ? new Set(selectedRoleIds) : null
-  const chunks: BlobPart[] = [JSON.stringify({ type: "jinyu-memory-archive", version: 1 }) + "\n"]
+  const chunks: BlobPart[] = [JSON.stringify({ type: "mchat2-memory-archive", version: 1 }) + "\n"]
   const allMemories = selected
     ? await Promise.all([...selected].map(async rid => {
         const items = await getMemoriesByRole(rid)

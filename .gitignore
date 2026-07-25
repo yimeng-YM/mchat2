@@ -15,6 +15,9 @@ release/
 # Codex workspace
 .codex/
 
+# Claude
+.claude/
+
 # TypeScript build info
 tsconfig.tsbuildinfo
 

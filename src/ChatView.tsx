@@ -1,12 +1,14 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { AlertCircle, ArrowLeft, Ellipsis, Image as ImageIcon, Mic, Paperclip, Send } from 'lucide-react'
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { AlertCircle, ArrowLeft, Bug, Ellipsis, Image as ImageIcon, Mic, Send } from 'lucide-react'
 import { Avatar } from './Avatar'
 import { ChatMessage } from './ChatMessage'
 import { MessageGroupEditor } from './MessageGroupEditor'
 import { loadModelConfig, requestAiReply } from './ai-service'
 import { parseAssistantReply } from './chat-protocol'
-import { hasNativeDeviceFeatures, pickNativeAttachment, showReplyNotification, startVoiceInput } from './device-features'
-import { listRoleEmojiCatalog, type EmojiAsset, type StoredMemory } from './data-library'
+import { toggleDebugLogging } from './debug-log'
+import { hasNativeDeviceFeatures, pickNativeImage, showReplyNotification, startVoiceInput } from './device-features'
+import { listRoleEmojiCatalog, saveConversationMessages, type EmojiAsset, type StoredMemory } from './data-library'
+import { emitConversationIncoming } from './conversation-events'
 import {
   loadRelevantMemories,
   extractMemoriesFromConversation,
@@ -18,6 +20,9 @@ import {
 import { playMessageTone, type AppPreferences } from './preferences'
 import type { ChatAttachment, Message, Role } from './chat-types'
 
+// 隐藏调试模式暗号：在任意对话输入框输入后开启/关闭网络请求记录。
+const DEBUG_TOGGLE_CODE = '/上上下下左右左右baba'
+
 let lastMessageId = Date.now()
 
 function nextMessageId() {
@@ -27,6 +32,28 @@ function nextMessageId() {
 
 function messageTime() {
   return new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+}
+
+function startOfDay(timestamp: number) {
+  const date = new Date(timestamp)
+  date.setHours(0, 0, 0, 0)
+  return date.getTime()
+}
+
+// 返回该消息之上应显示的日期分隔文案；与上一条同一天则返回空串（不显示）。
+// 首条消息（无上一条）总会显示分隔。文案：今天 / 昨天 / 具体日期。
+function dateDividerLabel(currentId: number, previousId?: number): string {
+  const current = startOfDay(currentId)
+  if (previousId !== undefined && startOfDay(previousId) === current) return ''
+  const today = startOfDay(Date.now())
+  const dayMs = 86_400_000
+  if (current === today) return '今天'
+  if (current === today - dayMs) return '昨天'
+  const date = new Date(current)
+  const sameYear = date.getFullYear() === new Date().getFullYear()
+  return date.toLocaleDateString('zh-CN', sameYear
+    ? { month: 'long', day: 'numeric' }
+    : { year: 'numeric', month: 'long', day: 'numeric' })
 }
 
 function nextGroupId(prefix: 'user' | 'assistant') {
@@ -47,6 +74,9 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
   const [draft, setDraft] = useState('')
   const [typing, setTyping] = useState(false)
   const [sendError, setSendError] = useState('')
+  const [memoryError, setMemoryError] = useState('')
+  const [debugNotice, setDebugNotice] = useState('')
+  const debugNoticeTimerRef = useRef<number | null>(null)
   const [queuedCount, setQueuedCount] = useState(0)
   const [emojiCatalog, setEmojiCatalog] = useState<EmojiAsset[]>([])
   const [memories, setMemories] = useState<StoredMemory[]>([])
@@ -56,7 +86,6 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
   const messagesContainerRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
-  const fileInputRef = useRef<HTMLInputElement>(null)
   const mountedRef = useRef(true)
   const messagesRef = useRef(messages)
   const queueRef = useRef<Message[]>([])
@@ -64,6 +93,7 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
   const requestInFlightRef = useRef(false)
   const flushRequestedRef = useRef(false)
   const autoTimerRef = useRef<number | null>(null)
+  const stickToBottomRef = useRef(true)
 
   const emojiMap = useMemo(() => new Map(emojiCatalog.map(item => [item.name, item])), [emojiCatalog])
 
@@ -79,19 +109,57 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
     return () => { cancelled = true }
   }, [role.id])
 
-  useLayoutEffect(() => {
+  const scrollToBottom = () => {
     const container = messagesContainerRef.current
-    if (!container) return
-    container.scrollTop = container.scrollHeight
-    const frame = requestAnimationFrame(() => { container.scrollTop = container.scrollHeight })
+    if (container) container.scrollTop = container.scrollHeight
+  }
+
+  useLayoutEffect(() => {
+    if (!messagesContainerRef.current) return
+    // 新消息或输入状态变化时视为回到底部，其后加载的图片/表情随之跟随。
+    stickToBottomRef.current = true
+    scrollToBottom()
+    const frame = requestAnimationFrame(scrollToBottom)
     return () => cancelAnimationFrame(frame)
   }, [messages.length, typing])
+
+  // 图片、表情等异步加载完成后才撑开高度，需在其加载完成时再次下滑。
+  // 同时记录用户是否停留在底部，向上翻看历史时不强制拽回底部。
+  useEffect(() => {
+    const container = messagesContainerRef.current
+    if (!container) return
+    const onScroll = () => {
+      stickToBottomRef.current = container.scrollHeight - container.scrollTop - container.clientHeight < 60
+    }
+    // <img> 的 load 事件不冒泡，用捕获阶段监听容器内所有图片/表情的加载完成。
+    const onLoad = (event: Event) => {
+      if ((event.target as HTMLElement | null)?.tagName === 'IMG' && stickToBottomRef.current) scrollToBottom()
+    }
+    container.addEventListener('scroll', onScroll, { passive: true })
+    container.addEventListener('load', onLoad, true)
+    return () => {
+      container.removeEventListener('scroll', onScroll)
+      container.removeEventListener('load', onLoad, true)
+    }
+  }, [])
+
+  // 键盘弹出使可视视口变化时，保持最新消息与输入框可见。
+  useEffect(() => {
+    const viewport = window.visualViewport
+    if (!viewport) return
+    const keepBottomVisible = () => {
+      if (stickToBottomRef.current) requestAnimationFrame(scrollToBottom)
+    }
+    viewport.addEventListener('resize', keepBottomVisible)
+    return () => viewport.removeEventListener('resize', keepBottomVisible)
+  }, [])
 
   useEffect(() => {
     mountedRef.current = true
     return () => {
       mountedRef.current = false
       if (autoTimerRef.current !== null) window.clearTimeout(autoTimerRef.current)
+      if (debugNoticeTimerRef.current !== null) window.clearTimeout(debugNoticeTimerRef.current)
     }
   }, [])
 
@@ -118,6 +186,91 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
     }
   }
 
+  // 基于给定的完整历史请求一次回复并追加，供正常发送与“保存并发送”共用。
+  // 调用方需保证 requestInFlightRef 为空闲，并已把 sentHistory 写入 messagesRef。
+  const runAssistantReply = async (sentHistory: Message[]) => {
+    requestInFlightRef.current = true
+    flushRequestedRef.current = false
+    setTyping(true)
+    setSendError('')
+    setMemoryError('')
+
+    // 注意：本函数为脱离组件生命周期的后台任务。即使 ChatView 因切换界面 / 角色
+    // 而卸载，async 闭包仍会跑完——回复照常入库并广播事件，由常驻的 App 更新
+    // 未读、提示音与通知；记忆提取也照常进行。仅 React setState 需 mountedRef 守卫。
+    const roleId = role.id
+    try {
+      const [catalog, loadedMemories] = await Promise.all([
+        listRoleEmojiCatalog(roleId),
+        loadRelevantMemories(roleId),
+      ])
+      if (mountedRef.current) {
+        setEmojiCatalog(catalog)
+        setMemories(loadedMemories)
+      }
+      memoriesRef.current = loadedMemories
+      const emojiNames = catalog.map(item => item.name)
+      const reply = await requestAiReply(config, role, sentHistory, emojiNames, loadedMemories, preferences.userName)
+      const groupId = nextGroupId('assistant')
+      const receivedMessages: Message[] = parseAssistantReply(reply, emojiNames).map(part => ({
+        id: nextMessageId(),
+        from: 'them',
+        text: part.text,
+        kind: part.kind,
+        groupId,
+        delivery: 'read',
+        time: messageTime(),
+      }))
+      for (let index = 0; index < receivedMessages.length; index += 1) {
+        if (index > 0) await new Promise(resolve => window.setTimeout(resolve, 1000))
+        const message = receivedMessages[index]
+        messagesRef.current = [...messagesRef.current, message]
+        // 直接持久化（固定 roleId），并广播给 App 逐条并入状态、按需计未读。
+        void saveConversationMessages(roleId, [message])
+        emitConversationIncoming({ roleId, roleName: role.name, avatar: role.avatar, messages: [message] })
+      }
+      if (preferences.messageSound) playMessageTone('received')
+      if (preferences.notificationsEnabled && document.hidden) {
+        const preview = receivedMessages.map(message => message.kind === 'emoji' ? `[表情：${message.text}]` : message.text).join(' ')
+        void showReplyNotification(roleId, role.name, preferences.notificationPreview ? preview : '收到一条新消息', role.avatar)
+      }
+
+      // 记忆提取（纯异步、直接落库，与组件是否挂载无关）
+      const roundCount = incrementConversationRound(roleId)
+      void updateMemoryRoundAccess(roleId, roundCount, loadedMemories.map(memory => memory.id))
+      if (shouldExtractMemory(roleId, preferences.memoryExtractionInterval)) {
+        const recentMessages = sentHistory.slice(-config.contextMessageCount).concat(receivedMessages).map(message => ({
+          from: message.from,
+          text: message.text,
+          kind: message.kind,
+        }))
+        void extractMemoriesFromConversation(config, role, recentMessages, roleId).then(async (output) => {
+          const { newMemories, memoryAdjustments, archiveIds } = output
+          if (!newMemories.length && !memoryAdjustments.length && !archiveIds.length) return
+          await deduplicateAndSaveMemories(roleId, newMemories, memoryAdjustments, archiveIds)
+          const updated = await loadRelevantMemories(roleId)
+          if (mountedRef.current) {
+            setMemories(updated)
+            memoriesRef.current = updated
+          }
+        }).catch(error => {
+          console.error('长期记忆提取失败', error)
+          if (mountedRef.current) {
+            setMemoryError(error instanceof Error
+              ? error.message
+              : '长期记忆提取失败，请检查记忆模型设置')
+          }
+        })
+      }
+    } catch (error) {
+      if (mountedRef.current) setSendError(error instanceof Error ? error.message : '发送失败，请检查模型设置')
+    } finally {
+      requestInFlightRef.current = false
+      if (mountedRef.current) setTyping(false)
+      if (mountedRef.current && flushRequestedRef.current && queueRef.current.length) void flushQueue()
+    }
+  }
+
   const flushQueue = async () => {
     clearAutoTimer()
     if (requestInFlightRef.current) {
@@ -134,75 +287,7 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
     const sentHistory = messagesRef.current.map(message => queuedIds.has(message.id) ? { ...message, delivery: 'sent' as const } : message)
     messagesRef.current = sentHistory
     updateMessages(sentHistory.filter(message => queuedIds.has(message.id)))
-    requestInFlightRef.current = true
-    flushRequestedRef.current = false
-    setTyping(true)
-    setSendError('')
-
-    try {
-      const [catalog, loadedMemories] = await Promise.all([
-        listRoleEmojiCatalog(role.id),
-        loadRelevantMemories(role.id),
-      ])
-      if (!mountedRef.current) return
-      setEmojiCatalog(catalog)
-      setMemories(loadedMemories)
-      memoriesRef.current = loadedMemories
-      const emojiNames = catalog.map(item => item.name)
-      const reply = await requestAiReply(config, role, sentHistory, emojiNames, loadedMemories)
-      if (!mountedRef.current) return
-      const groupId = nextGroupId('assistant')
-      const receivedMessages: Message[] = parseAssistantReply(reply, emojiNames).map(part => ({
-        id: nextMessageId(),
-        from: 'them',
-        text: part.text,
-        kind: part.kind,
-        groupId,
-        delivery: 'read',
-        time: messageTime(),
-      }))
-      for (let index = 0; index < receivedMessages.length; index += 1) {
-        if (index > 0) await new Promise(resolve => window.setTimeout(resolve, 520))
-        if (!mountedRef.current) return
-        const message = receivedMessages[index]
-        messagesRef.current = [...messagesRef.current, message]
-        appendMessages([message])
-      }
-      if (preferences.messageSound) playMessageTone('received')
-      if (preferences.notificationsEnabled && document.hidden) {
-        const preview = receivedMessages.map(message => message.kind === 'emoji' ? `[表情：${message.text}]` : message.text).join(' ')
-        void showReplyNotification(role.name, preferences.notificationPreview ? preview : '收到一条新消息', role.avatar)
-      }
-
-      // 记忆提取
-      const roundCount = incrementConversationRound(role.id)
-      void updateMemoryRoundAccess(role.id, roundCount, loadedMemories.map(memory => memory.id))
-      if (shouldExtractMemory(role.id, preferences.memoryExtractionInterval)) {
-        // 提取记忆（不阻塞消息展示）
-        const recentMessages = sentHistory.slice(-config.contextMessageCount).concat(receivedMessages).map(message => ({
-          from: message.from,
-          text: message.text,
-          kind: message.kind,
-        }))
-        void extractMemoriesFromConversation(config, role, recentMessages, role.id).then(async (output) => {
-          if (!mountedRef.current) return
-          const { newMemories, memoryAdjustments, archiveIds } = output
-          if (!newMemories.length && !memoryAdjustments.length && !archiveIds.length) return
-          await deduplicateAndSaveMemories(role.id, newMemories, memoryAdjustments, archiveIds)
-          const updated = await loadRelevantMemories(role.id)
-          if (mountedRef.current) {
-            setMemories(updated)
-            memoriesRef.current = updated
-          }
-        })
-      }
-    } catch (error) {
-      if (mountedRef.current) setSendError(error instanceof Error ? error.message : '发送失败，请检查模型设置')
-    } finally {
-      requestInFlightRef.current = false
-      if (mountedRef.current) setTyping(false)
-      if (mountedRef.current && flushRequestedRef.current && queueRef.current.length) void flushQueue()
-    }
+    await runAssistantReply(sentHistory)
   }
 
   const scheduleAutoFlush = () => {
@@ -240,38 +325,37 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
 
   const enqueueAttachment = (attachment: ChatAttachment) => {
     enqueueMessage({
-      text: attachment.kind === 'image' ? `[图片：${attachment.name}]` : `[文件：${attachment.name}]`,
+      text: `[图片：${attachment.name}]`,
       kind: 'attachment',
       attachment,
     })
     requestAnimationFrame(() => textareaRef.current?.focus())
   }
 
-  const pickAttachment = async (kind: 'image' | 'file') => {
+  const pickImage = async () => {
     try {
       if (hasNativeDeviceFeatures()) {
-        const attachment = await pickNativeAttachment(role.id, kind)
+        const attachment = await pickNativeImage(role.id)
         if (attachment) enqueueAttachment(attachment)
       } else {
-        (kind === 'image' ? imageInputRef : fileInputRef).current?.click()
+        imageInputRef.current?.click()
       }
     } catch (error) {
-      setSendError(error instanceof Error ? error.message : '无法读取所选文件')
+      setSendError(error instanceof Error ? error.message : '无法读取所选图片')
     }
   }
 
-  const useWebAttachment = (file: File | undefined, kind: 'image' | 'file') => {
+  const useWebImage = (file: File | undefined) => {
     if (!file) return
     enqueueAttachment({
       id: `web-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-      kind,
+      kind: 'image',
       name: file.name,
-      mime: file.type || 'application/octet-stream',
+      mime: file.type || 'image/jpeg',
       size: file.size,
       blob: file,
     })
-    if (kind === 'image' && imageInputRef.current) imageInputRef.current.value = ''
-    if (kind === 'file' && fileInputRef.current) fileInputRef.current.value = ''
+    if (imageInputRef.current) imageInputRef.current.value = ''
   }
 
   const beginVoiceInput = async () => {
@@ -289,10 +373,19 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
   }
 
   const openGroupEditor = (message: Message) => {
-    const group = message.groupId
-      ? messagesRef.current.filter(item => item.groupId === message.groupId)
-      : [message]
-    setEditingGroup(group)
+    // 取该消息所在的、同一发送方的连续整段消息，用户消息与 AI 消息表现一致：
+    // 长按任意一条即把整段（含队列中未发送的消息）一起放入编辑。
+    const history = messagesRef.current
+    const anchor = history.findIndex(item => item.id === message.id)
+    if (anchor < 0) {
+      setEditingGroup([message])
+      return
+    }
+    let start = anchor
+    let end = anchor
+    while (start > 0 && history[start - 1].from === message.from) start -= 1
+    while (end < history.length - 1 && history[end + 1].from === message.from) end += 1
+    setEditingGroup(history.slice(start, end + 1))
   }
 
   const saveEditedGroup = (value: string) => {
@@ -335,6 +428,67 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
     setEditingGroup(null)
   }
 
+  // 从用户编辑的这组消息重新开始对话：替换该组内容为已发送状态，
+  // 删除其后的所有消息（含对方回复），随后重新请求一次回复。
+  const saveAndResendGroup = (value: string) => {
+    if (!editingGroup?.length) return
+    if (requestInFlightRef.current) {
+      setEditingGroup(null)
+      setSendError('对方正在回复，请稍候再试。')
+      return
+    }
+    const emojiNames = emojiCatalog.map(item => item.name)
+    const groupId = nextGroupId('user')
+    const replacement: Message[] = value.split('$').map(part => part.trim()).filter(Boolean).map(text => {
+      const match = /^<([^<>]+)>$/.exec(text)
+      const isEmoji = match && emojiNames.includes(match[1].trim())
+      return {
+        id: nextMessageId(),
+        from: 'me' as const,
+        text: isEmoji ? match![1].trim() : text,
+        kind: isEmoji ? 'emoji' as const : 'text' as const,
+        groupId,
+        delivery: 'sent' as const,
+        edited: true,
+        time: messageTime(),
+      }
+    })
+    if (!replacement.length) return
+
+    const history = messagesRef.current
+    const firstIndex = history.findIndex(item => item.id === editingGroup[0].id)
+    const keep = firstIndex >= 0 ? history.slice(0, firstIndex) : history
+    const removedIds = (firstIndex >= 0 ? history.slice(firstIndex) : []).map(item => item.id)
+    const nextHistory = [...keep, ...replacement]
+
+    // 清理仍在队列/定时器中的内容，避免残留旧消息。
+    clearAutoTimer()
+    const removedSet = new Set(removedIds)
+    queueRef.current = queueRef.current.filter(item => !removedSet.has(item.id))
+    queueGroupRef.current = ''
+    setQueuedCount(queueRef.current.length)
+
+    messagesRef.current = nextHistory
+    replaceMessageGroup(removedIds, replacement)
+    setEditingGroup(null)
+    if (preferences.messageSound) playMessageTone('sent')
+    void runAssistantReply(nextHistory)
+  }
+
+  const maybeToggleDebug = (text: string) => {
+    if (text.trim() !== DEBUG_TOGGLE_CODE) return false
+    const enabled = toggleDebugLogging()
+    setDraft('')
+    if (debugNoticeTimerRef.current !== null) window.clearTimeout(debugNoticeTimerRef.current)
+    setDebugNotice(enabled ? '调试模式已开启，开始记录网络请求。' : '调试模式已关闭，记录已清空。')
+    debugNoticeTimerRef.current = window.setTimeout(() => {
+      if (mountedRef.current) setDebugNotice('')
+      debugNoticeTimerRef.current = null
+    }, 2600)
+    requestAnimationFrame(() => textareaRef.current?.focus())
+    return true
+  }
+
   const sendDisabled = config.queueMode === 'auto'
     ? !draft.trim()
     : !draft.trim() && queuedCount === 0
@@ -355,32 +509,37 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
       <div className="chat-actions"><button className="icon-btn accent-soft role-menu-button" onClick={openEditor} aria-label="编辑当前角色"><Ellipsis /></button></div>
     </header>
     <div className="messages" ref={messagesContainerRef}>
-      {messages.length > 0 && <div className="date-divider"><span>今天</span></div>}
-      {messages.map(message => <ChatMessage
-        key={message.id}
-        message={message}
-        role={role}
-        emoji={message.kind === 'emoji' ? emojiMap.get(message.text) : undefined}
-        userName={preferences.userName}
-        userAvatar={preferences.userAvatar}
-        onEdit={openGroupEditor}
-      />)}
+      {messages.map((message, index) => {
+        // 消息 id 由 Date.now() 生成，据此按自然日分隔。日期变化时插入分隔条。
+        const divider = dateDividerLabel(message.id, messages[index - 1]?.id)
+        return <Fragment key={message.id}>
+          {divider && <div className="date-divider"><span>{divider}</span></div>}
+          <ChatMessage
+            message={message}
+            role={role}
+            emoji={message.kind === 'emoji' ? emojiMap.get(message.text) : undefined}
+            userName={preferences.userName}
+            userAvatar={preferences.userAvatar}
+            onEdit={openGroupEditor}
+          />
+        </Fragment>
+      })}
       {!messages.length && <div className="empty-conversation"><MessageEmptyIcon /><strong>开始聊天</strong><span>你们的消息会保存在这台设备上</span></div>}
     </div>
     <div className="composer-wrap">
       <div className="composer-tools">
-        <button onPointerDown={event => event.preventDefault()} onClick={() => void pickAttachment('image')} aria-label="发送图片"><ImageIcon /></button>
-        <button onPointerDown={event => event.preventDefault()} onClick={() => void pickAttachment('file')} aria-label="发送文件"><Paperclip /></button>
-        <input ref={imageInputRef} hidden type="file" accept="image/*" onChange={event => useWebAttachment(event.target.files?.[0], 'image')} />
-        <input ref={fileInputRef} hidden type="file" onChange={event => useWebAttachment(event.target.files?.[0], 'file')} />
+        <button onPointerDown={event => event.preventDefault()} onClick={() => void pickImage()} aria-label="发送图片"><ImageIcon /></button>
+        <input ref={imageInputRef} hidden type="file" accept="image/*" onChange={event => useWebImage(event.target.files?.[0])} />
       </div>
       {sendError && <div className="send-error"><AlertCircle />{sendError}</div>}
+      {memoryError && <div className="send-error memory-error"><AlertCircle />{memoryError}</div>}
+      {debugNotice && <div className="send-error debug-notice"><Bug />{debugNotice}</div>}
       <div className="composer">
         <textarea
           ref={textareaRef}
           rows={1}
           value={draft}
-          onChange={event => setDraft(event.target.value)}
+          onChange={event => { if (!maybeToggleDebug(event.target.value)) setDraft(event.target.value) }}
           onKeyDown={event => {
             if (event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault()
@@ -400,7 +559,12 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
         ><Send /></button>
       </div>
     </div>
-    {editingGroup && <MessageGroupEditor messages={editingGroup} onCancel={() => setEditingGroup(null)} onSave={saveEditedGroup} />}
+    {editingGroup && <MessageGroupEditor
+      messages={editingGroup}
+      onCancel={() => setEditingGroup(null)}
+      onSave={saveEditedGroup}
+      onSaveAndSend={saveAndResendGroup}
+    />}
   </main>
 }
 

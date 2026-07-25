@@ -4,11 +4,12 @@ import type { ChatAttachment } from './chat-types'
 type NativeAttachment = Omit<ChatAttachment, 'uri' | 'rawUri'> & { uri: string }
 
 interface DeviceFeaturesPlugin {
-  pickAttachment(options: { roleId: number; kind: 'image' | 'file' }): Promise<NativeAttachment | { cancelled: true }>
+  pickImage(options: { roleId: number }): Promise<NativeAttachment | { cancelled: true }>
   readImageDataUrl(options: { uri: string; maxDimension: number; quality: number }): Promise<{ dataUrl: string }>
   startSpeech(): Promise<{ text: string } | { cancelled: true }>
   requestNotifications(): Promise<{ granted: boolean }>
-  notify(options: { title: string; body: string; avatarDataUrl?: string }): Promise<void>
+  notify(options: { roleId: number; title: string; body: string; avatarDataUrl?: string }): Promise<void>
+  clearNotifications(options: { roleId?: number }): Promise<void>
   removeRoleFiles(options: { roleId: number }): Promise<void>
 }
 
@@ -18,8 +19,8 @@ export function hasNativeDeviceFeatures() {
   return Capacitor.isNativePlatform() && Capacitor.isPluginAvailable('DeviceFeatures')
 }
 
-export async function pickNativeAttachment(roleId: number, kind: 'image' | 'file') {
-  const result = await deviceFeatures.pickAttachment({ roleId, kind })
+export async function pickNativeImage(roleId: number) {
+  const result = await deviceFeatures.pickImage({ roleId })
   if ('cancelled' in result) return null
   return {
     ...result,
@@ -51,7 +52,6 @@ async function imageBlobDataUrl(blob: Blob, maxDimension: number, quality: numbe
 }
 
 export async function getAttachmentImageDataUrl(attachment: ChatAttachment) {
-  if (attachment.kind !== 'image') return ''
   if (hasNativeDeviceFeatures() && attachment.rawUri) {
     return (await deviceFeatures.readImageDataUrl({
       uri: attachment.rawUri,
@@ -124,9 +124,15 @@ export async function requestNotificationPermission() {
   return (await deviceFeatures.requestNotifications()).granted
 }
 
-export async function showReplyNotification(title: string, body: string, avatar?: string) {
+export async function showReplyNotification(roleId: number, title: string, body: string, avatar?: string) {
   if (!hasNativeDeviceFeatures()) return
-  await deviceFeatures.notify({ title, body, avatarDataUrl: avatar ? await notificationAvatarDataUrl(avatar) : undefined })
+  await deviceFeatures.notify({ roleId, title, body, avatarDataUrl: avatar ? await notificationAvatarDataUrl(avatar) : undefined })
+}
+
+// 用户查看对应会话后清除其系统通知（roleId 省略时清除全部）。
+export async function clearRoleNotification(roleId?: number) {
+  if (!hasNativeDeviceFeatures()) return
+  await deviceFeatures.clearNotifications(roleId === undefined ? {} : { roleId })
 }
 
 export async function removeNativeRoleFiles(roleId: number) {

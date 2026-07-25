@@ -1,4 +1,4 @@
-package com.mchat2.jinyu;
+package com.mchat2;
 
 import android.app.Activity;
 import android.content.ClipData;
@@ -249,7 +249,7 @@ public class LargeMediaPlugin extends Plugin {
         Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("application/x-ndjson");
-        intent.putExtra(Intent.EXTRA_TITLE, call.getString("name", "jinyu-conversations.ndjson"));
+        intent.putExtra(Intent.EXTRA_TITLE, call.getString("name", "mchat2-conversations.ndjson"));
         startActivityForResult(call, intent, "saveTextExportResult");
     }
 
@@ -419,7 +419,7 @@ public class LargeMediaPlugin extends Plugin {
 
     private class MediaDatabase extends SQLiteOpenHelper {
         MediaDatabase() {
-            super(getContext(), "jinyu-media.db", null, 1);
+            super(getContext(), "mchat2-media.db", null, 1);
         }
 
         @Override

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { App as CapacitorApp } from '@capacitor/app'
 import type { PluginListenerHandle } from '@capacitor/core'
 import {
@@ -7,7 +7,9 @@ import {
 import { Avatar } from './Avatar'
 import { ChatView } from './ChatView'
 import { DataSettings } from './DataSettings'
-import { requestNotificationPermission } from './device-features'
+import { DebugOverlay } from './DebugOverlay'
+import { clearRoleNotification, requestNotificationPermission } from './device-features'
+import { useKeyboardInset } from './keyboard-inset'
 import { ModelSettings } from './ModelSettings'
 import { QueueSettings } from './QueueSettings'
 import { RoleEditorPanel, type EditableRole } from './RoleEditorPanel'
@@ -21,6 +23,7 @@ import {
 import type { Message, Role } from './chat-types'
 import { resetConversationRoundCount } from './memory-service'
 import { dispatchNativeBackDismiss } from './native-back'
+import { onConversationIncoming } from './conversation-events'
 import { runViewTransition } from './view-transitions'
 import { UserAvatar } from './UserAvatar'
 
@@ -67,10 +70,15 @@ function ConversationList({ roles, messages, selected, onSelect, onCreate, mobil
   mobileOpen: boolean
 }) {
   const [query, setQuery] = useState('')
-  const filtered = roles.filter(role => {
-    const last = lastMessage(messages[role.id])
-    return role.name.includes(query) || messagePreview(last).includes(query)
-  })
+  // 会话按最近活跃排序：最后一条消息越新越靠上，收到新消息的角色自然置顶；
+  // 尚无消息的角色用其 id（创建时间）作为排序键。消息 id 由 Date.now() 生成，可跨角色比较。
+  const recency = (role: Role) => lastMessage(messages[role.id])?.id ?? role.id
+  const filtered = roles
+    .filter(role => {
+      const last = lastMessage(messages[role.id])
+      return role.name.includes(query) || messagePreview(last).includes(query)
+    })
+    .sort((a, b) => recency(b) - recency(a))
 
   return <section className={`conversations ${mobileOpen ? 'mobile-open' : ''}`}>
     <header className="section-title"><h1>消息</h1><button className="icon-btn accent-soft create-role" onClick={onCreate} aria-label="新建角色"><Plus /></button></header>
@@ -81,7 +89,7 @@ function ConversationList({ roles, messages, selected, onSelect, onCreate, mobil
         return <button key={role.id} className={`conversation ${selected === role.id ? 'selected' : ''}`} onClick={() => onSelect(role.id)}>
           <Avatar role={role} />
           <span className="conversation-copy"><strong>{role.name}</strong><small>{messagePreview(last)}</small></span>
-          <span className="conversation-meta"><time>{last?.time ?? ''}</time></span>
+          <span className="conversation-meta"><time>{last?.time ?? ''}</time>{role.unread > 0 && <span className="conversation-unread-dot" role="status" aria-label={`${role.unread} 条未读消息`}>{role.unread > 99 ? '99+' : role.unread}</span>}</span>
         </button>
       })}
       {!filtered.length && <div className="empty-small">{roles.length ? '没有找到相关会话' : '点击右上角 + 创建第一个角色'}</div>}
@@ -134,7 +142,7 @@ function SettingsPage({ dark, setDark, roles, preferences, setPreferences, onDat
   }
 
   return <main className="page settings-page view-surface">
-    <header className="page-header"><div><h1>偏好设置</h1><p>把近语调整成你最舒服的样子。</p></div></header>
+    <header className="page-header"><div><h1>偏好设置</h1><p>把 MChat2 调整成你最舒服的样子。</p></div></header>
     <div className="settings-layout">
       <nav className="settings-nav">
         <button className={section === 'appearance' ? 'active' : ''} onClick={() => chooseSection('appearance')}><Palette />外观</button>
@@ -202,14 +210,18 @@ export default function App() {
   const [preferences, setPreferences] = useState(loadAppPreferences)
   const [roles, setRoles] = useState<Role[]>(() => {
     try {
-      const stored = JSON.parse(localStorage.getItem('jinyu-roles') ?? '[]') as Role[]
-      return stored.filter(role => ![1, 2, 3, 4].includes(role.id))
+      const stored = JSON.parse(localStorage.getItem('mchat2-roles') ?? '[]') as Role[]
+      return stored.filter(role => ![1, 2, 3, 4].includes(role.id)).map(role => ({ ...role, unread: Number.isFinite(role.unread) ? role.unread : 0 }))
     } catch {
       return []
     }
   })
 
   const selectedRole = useMemo(() => roles.find(role => role.id === selectedId) ?? null, [roles, selectedId])
+  // 当前正在“对应聊天界面”查看的会话 id；不在该界面时为 null，收到回复即计入未读。
+  const activeConversationRef = useRef<number | null>(null)
+
+  useKeyboardInset()
 
   useEffect(() => {
     void removeLegacyDefaultData().catch(() => {})
@@ -239,7 +251,7 @@ export default function App() {
     return () => { cancelled = true }
   }, [selectedId])
 
-  useEffect(() => { localStorage.setItem('jinyu-roles', JSON.stringify(roles)) }, [roles])
+  useEffect(() => { localStorage.setItem('mchat2-roles', JSON.stringify(roles)) }, [roles])
   useEffect(() => { saveAppPreferences(preferences) }, [preferences])
 
   const reloadSelectedConversation = async () => {
@@ -248,12 +260,16 @@ export default function App() {
   }
 
   const navigate = (next: Page) => {
+    // 底部导航顺序：消息(chat) → 设置(settings)。去设置为前进，回消息为返回。
+    // 已在目标界面且无待关闭的编辑/草稿、列表显隐也不变时，视为无变化，跳过动画。
+    const nextMobileConversations = next === 'chat' ? true : mobileConversations
+    if (page === next && !roleEditor && !draftRole && mobileConversations === nextMobileConversations) return
     runViewTransition(() => {
       if (next === 'chat') setMobileConversations(true)
       setPage(next)
       setRoleEditor(false)
       setDraftRole(null)
-    })
+    }, next === 'settings' ? 'forward' : 'back')
   }
 
   const updateRole = (changes: EditableRole) => {
@@ -277,48 +293,73 @@ export default function App() {
     runViewTransition(() => {
       setDraftRole(emptyRole())
       setRoleEditor(true)
-    })
+    }, 'forward')
   }
 
   const closeRoleEditor = () => {
+    const isCreating = Boolean(draftRole)
     if (draftRole) void removeRoleData(draftRole.id).catch(() => {})
     runViewTransition(() => {
       setDraftRole(null)
       setRoleEditor(false)
-      setMobileConversations(true)
-    })
+      setMobileConversations(isCreating)
+    }, 'back')
   }
+  // 统一的“返回上一层”逻辑，供硬件返回键与右滑手势共用。
+  // 返回 true 表示已消费本次返回；false 表示已到根（可退出应用）。
+  const goBack = (): boolean => {
+    if (dispatchNativeBackDismiss()) return true
+
+    if (roleEditor) {
+      const isCreating = Boolean(draftRole)
+      if (draftRole) void removeRoleData(draftRole.id).catch(() => {})
+      runViewTransition(() => {
+        setDraftRole(null)
+        setRoleEditor(false)
+        setMobileConversations(isCreating)
+      }, 'back')
+      return true
+    }
+
+    if (page === 'settings') {
+      runViewTransition(() => {
+        setPage('chat')
+        setMobileConversations(true)
+      }, 'back')
+      return true
+    }
+
+    if (!mobileConversations) {
+      runViewTransition(() => setMobileConversations(true), 'back')
+      return true
+    }
+
+    return false
+  }
+
+  // 左滑打开当前选中会话（从会话列表进入聊天）。
+  const openSelectedChat = (): boolean => {
+    if (page !== 'chat' || !mobileConversations || selectedId === null) return false
+    runViewTransition(() => {
+      setRoles(current => current.map(role => role.id === selectedId && role.unread ? { ...role, unread: 0 } : role))
+      setRoleEditor(false)
+      setDraftRole(null)
+      setMobileConversations(false)
+    }, 'forward')
+    return true
+  }
+
+  const goBackRef = useRef(goBack)
+  goBackRef.current = goBack
+  const openSelectedChatRef = useRef(openSelectedChat)
+  openSelectedChatRef.current = openSelectedChat
+
   useEffect(() => {
     let listener: PluginListenerHandle | undefined
     let disposed = false
 
     void CapacitorApp.addListener('backButton', () => {
-      if (dispatchNativeBackDismiss()) return
-
-      if (roleEditor) {
-        if (draftRole) void removeRoleData(draftRole.id).catch(() => {})
-        runViewTransition(() => {
-          setDraftRole(null)
-          setRoleEditor(false)
-          setMobileConversations(true)
-        })
-        return
-      }
-
-      if (page === 'settings') {
-        runViewTransition(() => {
-          setPage('chat')
-          setMobileConversations(true)
-        })
-        return
-      }
-
-      if (!mobileConversations) {
-        runViewTransition(() => setMobileConversations(true))
-        return
-      }
-
-      void CapacitorApp.exitApp()
+      if (!goBackRef.current()) void CapacitorApp.exitApp()
     }).then(handle => {
       if (disposed) void handle.remove()
       else listener = handle
@@ -328,7 +369,45 @@ export default function App() {
       disposed = true
       if (listener) void listener.remove()
     }
-  }, [draftRole, mobileConversations, page, roleEditor, selectedRole])
+  }, [])
+
+  // 左右滑动手势：右滑返回上一层，左滑进入选中会话。仅响应触摸，避免桌面误触。
+  useEffect(() => {
+    const EDGE_IGNORE = '.settings-nav,.role-filter,.library-tabs,.model-options-popover,.range-input,.avatar-crop-stage,.image-lightbox,input[type=range],.crop-zoom'
+    let startX = 0
+    let startY = 0
+    let pointerId: number | null = null
+    let tracking = false
+
+    const onDown = (event: PointerEvent) => {
+      if (event.pointerType === 'mouse' || !event.isPrimary) return
+      if ((event.target as Element | null)?.closest(EDGE_IGNORE)) return
+      startX = event.clientX
+      startY = event.clientY
+      pointerId = event.pointerId
+      tracking = true
+    }
+    const onUp = (event: PointerEvent) => {
+      if (!tracking || event.pointerId !== pointerId) return
+      tracking = false
+      const dx = event.clientX - startX
+      const dy = event.clientY - startY
+      // 需为明显的横向滑动：水平位移足够大且明显超过纵向位移。
+      if (Math.abs(dx) < 64 || Math.abs(dx) < Math.abs(dy) * 1.4) return
+      if (dx > 0) goBackRef.current()
+      else openSelectedChatRef.current()
+    }
+    const onCancel = () => { tracking = false }
+
+    window.addEventListener('pointerdown', onDown, { passive: true })
+    window.addEventListener('pointerup', onUp, { passive: true })
+    window.addEventListener('pointercancel', onCancel, { passive: true })
+    return () => {
+      window.removeEventListener('pointerdown', onDown)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onCancel)
+    }
+  }, [])
 
   const deleteSelectedRole = async () => {
     if (!selectedRole) return
@@ -351,8 +430,56 @@ export default function App() {
   const appendSelectedMessages = (newMessages: Message[]) => {
     if (selectedId === null) return
     setAllMessages(previous => ({ ...previous, [selectedId]: [...(previous[selectedId] || []), ...newMessages] }))
+    const unreadReplies = newMessages.filter(message => message.from === 'them').length
+    // 只要不在“对应聊天界面”（切到列表 / 设置 / 角色编辑 / 应用后台），回复都计入未读。
+    if (unreadReplies > 0 && activeConversationRef.current !== selectedId) {
+      setRoles(current => current.map(role => role.id === selectedId
+        ? { ...role, unread: (role.unread || 0) + unreadReplies }
+        : role))
+    }
     void saveConversationMessages(selectedId, newMessages)
   }
+
+  // 后台会话事件：AI 回复由 ChatView 广播（即使已卸载），在此并入对应角色的消息状态，
+  // 并在“未正在查看该会话”时累计未读——保证切界面 / 切角色 / 后台时都能接收回复。
+  useEffect(() => onConversationIncoming(({ roleId, messages: incoming }) => {
+    setAllMessages(previous => {
+      const current = previous[roleId] || []
+      const existing = new Set(current.map(message => message.id))
+      const added = incoming.filter(message => !existing.has(message.id))
+      if (!added.length) return previous
+      return { ...previous, [roleId]: [...current, ...added] }
+    })
+    const unreadReplies = incoming.filter(message => message.from === 'them').length
+    if (unreadReplies > 0 && activeConversationRef.current !== roleId) {
+      setRoles(current => current.map(role => role.id === roleId
+        ? { ...role, unread: (role.unread || 0) + unreadReplies }
+        : role))
+    }
+  }), [])
+
+  useEffect(() => {
+    const syncActiveConversation = () => {
+      // 仅当停留在该会话的聊天界面（非列表 / 非设置 / 未开角色编辑 / 前台）才算“正在查看”。
+      const viewing = page === 'chat' && !mobileConversations && !roleEditor && !document.hidden
+      const activeId = viewing && selectedId !== null ? selectedId : null
+      activeConversationRef.current = activeId
+      if (activeId === null) return
+      setRoles(current => {
+        let changed = false
+        const next = current.map(role => {
+          if (role.id !== activeId || !role.unread) return role
+          changed = true
+          return { ...role, unread: 0 }
+        })
+        return changed ? next : current
+      })
+      void clearRoleNotification(activeId)
+    }
+    syncActiveConversation()
+    document.addEventListener('visibilitychange', syncActiveConversation)
+    return () => document.removeEventListener('visibilitychange', syncActiveConversation)
+  }, [mobileConversations, page, roleEditor, selectedId])
 
   const updateSelectedMessages = (changedMessages: Message[]) => {
     if (selectedId === null) return
@@ -378,18 +505,19 @@ export default function App() {
   }
 
   const editorRole = draftRole ?? selectedRole
-  const appClass = ['app', dark ? 'dark-mode' : '', page === 'chat' && !mobileConversations ? 'chat-open' : ''].filter(Boolean).join(' ')
+  // 聊天分支始终挂载（切到设置只用 CSS 隐藏），使进行中的回复 / 记忆任务不被卸载打断。
+  const appClass = ['app', dark ? 'dark-mode' : '', page === 'chat' && !mobileConversations ? 'chat-open' : '', page === 'settings' ? 'viewing-settings' : ''].filter(Boolean).join(' ')
 
   return <div className={appClass}>
     <Rail page={page} setPage={navigate} dark={dark} setDark={setDark} userName={preferences.userName} userAvatar={preferences.userAvatar} />
-    {page === 'chat' && <>
+    <>
       <ConversationList
         roles={roles}
         messages={messages}
         selected={selectedId}
         mobileOpen={mobileConversations}
         onCreate={createRole}
-        onSelect={id => runViewTransition(() => { setSelectedId(id); setRoleEditor(false); setDraftRole(null); setMobileConversations(false) })}
+        onSelect={id => runViewTransition(() => { setRoles(current => current.map(role => role.id === id && role.unread ? { ...role, unread: 0 } : role)); setSelectedId(id); setRoleEditor(false); setDraftRole(null); setMobileConversations(false) }, 'forward')}
       />
       {selectedRole ? <ChatView
         key={selectedRole.id}
@@ -399,8 +527,8 @@ export default function App() {
         appendMessages={appendSelectedMessages}
         updateMessages={updateSelectedMessages}
         replaceMessageGroup={replaceSelectedGroup}
-        openEditor={() => runViewTransition(() => setRoleEditor(true))}
-        onBack={() => runViewTransition(() => { setRoleEditor(false); setMobileConversations(true) })}
+        openEditor={() => runViewTransition(() => setRoleEditor(true), 'forward')}
+        onBack={() => runViewTransition(() => { setRoleEditor(false); setMobileConversations(true) }, 'back')}
       /> : <main className="chat empty-chat"><div><MessageCircle /><h2>还没有角色</h2><p>创建一个角色，开始你们的第一段对话。</p><button className="primary" onClick={createRole}><Plus />新建角色</button></div></main>}
       {roleEditor && editorRole && <RoleEditorPanel
         role={editorRole}
@@ -409,7 +537,7 @@ export default function App() {
         onSave={updateRole}
         onDelete={draftRole ? undefined : deleteSelectedRole}
       />}
-    </>}
+    </>
     {page === 'settings' && <SettingsPage
       dark={dark}
       setDark={setDark}
@@ -418,6 +546,7 @@ export default function App() {
       setPreferences={setPreferences}
       onDataChanged={reloadSelectedConversation}
     />}
+    <DebugOverlay />
   </div>
 }
 

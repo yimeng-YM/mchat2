@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 
-const nativeBackEvent = 'jinyu:native-back'
+const nativeBackEvent = 'mchat2:native-back'
 
 export function dispatchNativeBackDismiss() {
   const event = new Event(nativeBackEvent, { cancelable: true })
