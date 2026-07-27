@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type PointerEvent } from 'react'
 import { Check, RotateCcw, X } from 'lucide-react'
 import { useNativeBackDismiss } from './native-back'
 import { OverlayPortal } from './OverlayPortal'
+import { rangeProgressStyle } from './range-style'
 
 const STAGE_WIDTH = 210
 const STAGE_HEIGHT = 330
@@ -38,7 +39,7 @@ export function BackgroundCropper({ file, onCancel, onConfirm }: {
     if (!imageInfo) return 1
     return Math.max(STAGE_WIDTH / imageInfo.width, STAGE_HEIGHT / imageInfo.height)
   }, [imageInfo])
-  const zoomStyle = { '--range-progress': `${(zoom - 1) / 2 * 100}%` } as CSSProperties
+  const zoomStyle = rangeProgressStyle(zoom, 1, 3)
 
   const constrain = (point: Point, nextZoom = zoom) => {
     if (!imageInfo) return { x: 0, y: 0 }
@@ -68,7 +69,7 @@ export function BackgroundCropper({ file, onCancel, onConfirm }: {
 
   return <OverlayPortal><div className="crop-overlay" role="dialog" aria-modal="true" aria-labelledby="background-crop-title">
     <section className="crop-dialog background-crop-dialog">
-      <header><div><h2 id="background-crop-title">裁切聊天背景</h2><p>拖动图片选择聊天中显示的区域</p></div><button className="icon-btn" onClick={onCancel} aria-label="取消背景裁切"><X /></button></header>
+      <header><div><h2 id="background-crop-title">设置聊天背景</h2><p>拖动选择手机端画面；桌面端会保留竖图主体并智能铺满整页</p></div><button className="icon-btn" onClick={onCancel} aria-label="取消背景裁切"><X /></button></header>
       <div
         className="background-crop-stage"
         onPointerDown={(event: PointerEvent<HTMLDivElement>) => {

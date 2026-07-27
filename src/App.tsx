@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { App as CapacitorApp } from '@capacitor/app'
 import type { PluginListenerHandle } from '@capacitor/core'
 import {
-  Bell, Bot, BrainCircuit, Database, MessageCircle, MessageSquareText, Moon, Palette, Plus, Search, Settings, Sun, X,
+  Bell, Bot, BrainCircuit, Check, Database, Droplets, Layers, MessageCircle, MessageSquareText, Moon, Palette, Plus,
+  RotateCcw, Search, Settings, Sparkles, Sun, X,
 } from 'lucide-react'
 import { Avatar } from './Avatar'
 import { ChatView } from './ChatView'
+import { ColorPicker } from './ColorPicker'
 import { DataSettings } from './DataSettings'
 import { DebugOverlay } from './DebugOverlay'
 import { clearRoleNotification, requestNotificationPermission } from './device-features'
@@ -18,16 +20,165 @@ import {
   saveConversationMessages, updateConversationMessages,
 } from './data-library'
 import {
-  loadAppPreferences, MAX_MEMORY_EXTRACTION_INTERVAL, saveAppPreferences, type AppPreferences,
+  defaultAppPreferences, loadAppPreferences, MAX_MEMORY_EXTRACTION_INTERVAL, saveAppPreferences, type AppPreferences,
 } from './preferences'
 import type { Message, Role } from './chat-types'
 import { resetConversationRoundCount } from './memory-service'
 import { dispatchNativeBackDismiss } from './native-back'
 import { onConversationIncoming } from './conversation-events'
+import { rangeProgressStyle } from './range-style'
 import { runViewTransition } from './view-transitions'
 import { UserAvatar } from './UserAvatar'
 
 type Page = 'chat' | 'settings'
+type FluidPillDirection = 'forward' | 'backward'
+
+function useFluidPill(activeKey: string, activeIndex: number) {
+  const navRef = useRef<HTMLElement | null>(null)
+  const previousIndexRef = useRef(activeIndex)
+  const [direction, setDirection] = useState<FluidPillDirection>('forward')
+  const [pill, setPill] = useState({ x: 0, y: 0, width: 0, height: 0, ready: false })
+
+  useLayoutEffect(() => {
+    const previousIndex = previousIndexRef.current
+    previousIndexRef.current = activeIndex
+    if (activeIndex !== previousIndex) setDirection(activeIndex > previousIndex ? 'forward' : 'backward')
+  }, [activeIndex])
+
+  useLayoutEffect(() => {
+    const nav = navRef.current
+    if (!nav) return
+
+    const measure = () => {
+      const active = nav.querySelector<HTMLElement>('[data-fluid-active="true"]')
+      if (!active) return
+      const navRect = nav.getBoundingClientRect()
+      const activeRect = active.getBoundingClientRect()
+      const next = {
+        x: activeRect.left - navRect.left - nav.clientLeft + nav.scrollLeft,
+        y: activeRect.top - navRect.top - nav.clientTop + nav.scrollTop,
+        width: activeRect.width,
+        height: activeRect.height,
+        ready: true,
+      }
+      setPill(current => (
+        Math.abs(current.x - next.x) < 0.5
+        && Math.abs(current.y - next.y) < 0.5
+        && Math.abs(current.width - next.width) < 0.5
+        && Math.abs(current.height - next.height) < 0.5
+        && current.ready
+          ? current
+          : next
+      ))
+    }
+
+    const frame = window.requestAnimationFrame(measure)
+    const resizeObserver = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure)
+    resizeObserver?.observe(nav)
+    nav.querySelectorAll('button').forEach(button => resizeObserver?.observe(button))
+    nav.addEventListener('scroll', measure, { passive: true })
+    window.addEventListener('resize', measure)
+
+    return () => {
+      window.cancelAnimationFrame(frame)
+      resizeObserver?.disconnect()
+      nav.removeEventListener('scroll', measure)
+      window.removeEventListener('resize', measure)
+    }
+  }, [activeKey])
+
+  return {
+    navRef,
+    direction,
+    pillStyle: {
+      '--fluid-x': `${pill.x}px`,
+      '--fluid-y': `${pill.y}px`,
+      '--fluid-width': `${pill.width}px`,
+      '--fluid-height': `${pill.height}px`,
+      opacity: pill.ready ? 1 : 0,
+    } as CSSProperties,
+  }
+}
+
+function useOutlineHighlight(enabled: boolean) {
+  const rootRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    const root = rootRef.current
+    if (!root || !enabled) return
+
+    let currentAngle = 315
+    let targetAngle = currentAngle
+    let animationFrame = 0
+    let sensorPausedUntil = 0
+    const finePointer = window.matchMedia('(pointer:fine)').matches
+
+    const animate = () => {
+      const delta = ((targetAngle - currentAngle + 540) % 360) - 180
+      currentAngle = (currentAngle + delta * 0.16 + 360) % 360
+      root.style.setProperty('--outline-highlight-angle', `${currentAngle.toFixed(2)}deg`)
+      if (Math.abs(delta) > 0.12) animationFrame = window.requestAnimationFrame(animate)
+      else animationFrame = 0
+    }
+    const aimHighlight = (angle: number) => {
+      targetAngle = (angle + 360) % 360
+      if (!animationFrame) animationFrame = window.requestAnimationFrame(animate)
+    }
+    const followOrientation = (event: DeviceOrientationEvent) => {
+      if (performance.now() < sensorPausedUntil) return
+      if (event.beta === null || event.gamma === null) return
+      const beta = event.beta * Math.PI / 180
+      const gamma = Math.max(-90, Math.min(90, event.gamma)) * Math.PI / 180
+
+      // Project the device's higher edge into its screen plane. Positive beta
+      // raises the top edge; positive gamma lowers the right edge.
+      const naturalX = -Math.cos(beta) * Math.sin(gamma)
+      const naturalY = -Math.sin(beta)
+      if (Math.hypot(naturalX, naturalY) < 0.035) return
+
+      const screenRotation = (window.screen.orientation?.angle ?? 0) * Math.PI / 180
+      const screenX = naturalX * Math.cos(screenRotation) + naturalY * Math.sin(screenRotation)
+      const screenY = -naturalX * Math.sin(screenRotation) + naturalY * Math.cos(screenRotation)
+      aimHighlight(Math.atan2(screenY, screenX) * 180 / Math.PI + 90)
+    }
+    const followPointer = (event: PointerEvent) => {
+      if (!finePointer) return
+      const bounds = root.getBoundingClientRect()
+      const x = event.clientX - bounds.left - bounds.width / 2
+      const y = event.clientY - bounds.top - bounds.height / 2
+      aimHighlight(Math.atan2(y, x) * 180 / Math.PI + 90)
+    }
+    const pauseSensorHighlight = () => {
+      sensorPausedUntil = performance.now() + 160
+      targetAngle = currentAngle
+      if (animationFrame) {
+        window.cancelAnimationFrame(animationFrame)
+        animationFrame = 0
+      }
+    }
+
+    window.addEventListener('deviceorientation', followOrientation, { passive: true })
+    window.addEventListener('pointermove', followPointer, { passive: true })
+    root.addEventListener('scroll', pauseSensorHighlight, { capture: true, passive: true })
+    return () => {
+      window.removeEventListener('deviceorientation', followOrientation)
+      window.removeEventListener('pointermove', followPointer)
+      root.removeEventListener('scroll', pauseSensorHighlight, { capture: true })
+      if (animationFrame) window.cancelAnimationFrame(animationFrame)
+    }
+  }, [enabled])
+
+  return rootRef
+}
+
+function releaseActiveFocus() {
+  const blurActive = () => {
+    const active = document.activeElement
+    if (active instanceof HTMLElement && active !== document.body) active.blur()
+  }
+  blurActive()
+  window.requestAnimationFrame(blurActive)
+}
 
 function messagePreview(message?: Message) {
   if (!message) return '开始一段新对话'
@@ -40,6 +191,38 @@ function lastMessage(messages?: Message[]) {
   return messages?.[messages.length - 1]
 }
 
+const accentPresets = ['#6D5DFB', '#248B78', '#2878F0', '#D65C8D', '#E1773D', '#4D5562']
+
+function colorWithOpacity(color: string, opacity: number) {
+  const normalized = color.replace('#', '')
+  const channels = normalized.match(/.{2}/g)?.map(value => Number.parseInt(value, 16)) ?? [109, 93, 251]
+  return `rgba(${channels[0]}, ${channels[1]}, ${channels[2]}, ${Math.max(0, Math.min(100, opacity)) / 100})`
+}
+
+function accentInk(color: string) {
+  const normalized = color.replace('#', '')
+  const channels = normalized.match(/.{2}/g)?.map(value => Number.parseInt(value, 16)) ?? [109, 93, 251]
+  const luminance = (channels[0] * 299 + channels[1] * 587 + channels[2] * 114) / 1000
+  return luminance > 168 ? '#17201C' : '#FFFFFF'
+}
+
+function bubbleInk(color: string, opacity: number, dark: boolean) {
+  const normalized = color.replace('#', '')
+  const foreground = normalized.match(/.{2}/g)?.map(value => Number.parseInt(value, 16)) ?? [109, 93, 251]
+  const backdrop = dark ? [22, 26, 24] : [246, 245, 241]
+  const alpha = Math.max(0, Math.min(100, opacity)) / 100
+  const composite = foreground.map((channel, index) => channel * alpha + backdrop[index] * (1 - alpha))
+  const relativeLuminance = composite.reduce((sum, channel, index) => {
+    const linear = channel / 255 <= 0.03928
+      ? channel / 255 / 12.92
+      : ((channel / 255 + 0.055) / 1.055) ** 2.4
+    return sum + linear * [0.2126, 0.7152, 0.0722][index]
+  }, 0)
+  const darkContrast = (relativeLuminance + 0.05) / 0.064
+  const lightContrast = 1.05 / (relativeLuminance + 0.05)
+  return darkContrast >= lightContrast ? '#17201C' : '#FFFFFF'
+}
+
 function Rail({ page, setPage, dark, setDark, userName, userAvatar }: {
   page: Page
   setPage: (page: Page) => void
@@ -48,11 +231,16 @@ function Rail({ page, setPage, dark, setDark, userName, userAvatar }: {
   userName: string
   userAvatar: string
 }) {
+  const fluidPill = useFluidPill(page, page === 'chat' ? 0 : 1)
+
   return <aside className="rail">
     <button className="brand" onClick={() => setPage('chat')} aria-label="近聊首页"><MessageCircle /></button>
-    <nav>
-      <button className={page === 'chat' ? 'active' : ''} onClick={() => setPage('chat')}><MessageCircle /><span>消息</span></button>
-      <button className={page === 'settings' ? 'active' : ''} onClick={() => setPage('settings')}><Settings /><span>设置</span></button>
+    <nav ref={fluidPill.navRef} className="fluid-pill-nav main-fluid-nav">
+      <span className="fluid-pill-indicator" data-direction={fluidPill.direction} style={fluidPill.pillStyle} aria-hidden="true">
+        <i key={page} />
+      </span>
+      <button data-fluid-active={page === 'chat'} className={page === 'chat' ? 'active' : ''} onClick={() => setPage('chat')}><MessageCircle /><span>消息</span></button>
+      <button data-fluid-active={page === 'settings'} className={page === 'settings' ? 'active' : ''} onClick={() => setPage('settings')}><Settings /><span>设置</span></button>
     </nav>
     <div className="rail-bottom">
       <button onClick={() => setDark(!dark)} aria-label="切换主题">{dark ? <Sun /> : <Moon />}</button>
@@ -112,6 +300,28 @@ function Toggle({ label, checked, onChange, disabled = false }: {
   ><i /></button>
 }
 
+function AppearanceOpacityControl({ label, value, onChange }: {
+  label: string
+  value: number
+  onChange: (value: number) => void
+}) {
+  return <label className="surface-opacity-control">
+    <span>{label}</span>
+    <input
+      className="range-input"
+      style={rangeProgressStyle(value, 20, 100)}
+      type="range"
+      min="20"
+      max="100"
+      step="1"
+      value={value}
+      onChange={event => onChange(Number(event.target.value))}
+      aria-label={`${label}透明度`}
+    />
+    <output>{value}%</output>
+  </label>
+}
+
 function SettingsPage({ dark, setDark, roles, preferences, setPreferences, onDataChanged, onRolesImported }: {
   dark: boolean
   setDark: (value: boolean) => void
@@ -125,12 +335,13 @@ function SettingsPage({ dark, setDark, roles, preferences, setPreferences, onDat
   const [notificationNotice, setNotificationNotice] = useState('')
   const patchPreference = (changes: Partial<AppPreferences>) => setPreferences({ ...preferences, ...changes })
   const chooseSection = (next: typeof section) => setSection(next)
-  const memoryIntervalStyle = {
-    '--range-progress': `${preferences.memoryExtractionInterval > 0
-      ? (preferences.memoryExtractionInterval - 1) / (MAX_MEMORY_EXTRACTION_INTERVAL - 1) * 100
-      : 0}%`,
-  } as CSSProperties
-
+  const sectionOrder: Array<typeof section> = ['appearance', 'chat', 'model', 'notifications', 'data']
+  const fluidPill = useFluidPill(section, sectionOrder.indexOf(section))
+  const memoryIntervalStyle = rangeProgressStyle(
+    preferences.memoryExtractionInterval > 0 ? preferences.memoryExtractionInterval : 1,
+    1,
+    MAX_MEMORY_EXTRACTION_INTERVAL,
+  )
   const setNotifications = async (enabled: boolean) => {
     setNotificationNotice('')
     if (!enabled) {
@@ -145,20 +356,127 @@ function SettingsPage({ dark, setDark, roles, preferences, setPreferences, onDat
   return <main className="page settings-page view-surface">
     <header className="page-header"><div><h1>偏好设置</h1><p>把 MChat2 调整成你最舒服的样子。</p></div></header>
     <div className="settings-layout">
-      <nav className="settings-nav">
-        <button className={section === 'appearance' ? 'active' : ''} onClick={() => chooseSection('appearance')}><Palette />外观</button>
-        <button className={section === 'chat' ? 'active' : ''} onClick={() => chooseSection('chat')}><MessageSquareText />聊天体验</button>
-        <button className={section === 'model' ? 'active' : ''} onClick={() => chooseSection('model')}><Bot />模型</button>
-        <button className={section === 'notifications' ? 'active' : ''} onClick={() => chooseSection('notifications')}><Bell />消息通知</button>
-        <button className={section === 'data' ? 'active' : ''} onClick={() => chooseSection('data')}><Database />账户与数据</button>
+      <nav ref={fluidPill.navRef} className="settings-nav fluid-pill-nav settings-fluid-nav">
+        <span className="fluid-pill-indicator" data-direction={fluidPill.direction} style={fluidPill.pillStyle} aria-hidden="true">
+          <i key={section} />
+        </span>
+        <button data-fluid-active={section === 'appearance'} className={section === 'appearance' ? 'active' : ''} onClick={() => chooseSection('appearance')}><Palette />外观</button>
+        <button data-fluid-active={section === 'chat'} className={section === 'chat' ? 'active' : ''} onClick={() => chooseSection('chat')}><MessageSquareText />聊天体验</button>
+        <button data-fluid-active={section === 'model'} className={section === 'model' ? 'active' : ''} onClick={() => chooseSection('model')}><Bot />模型</button>
+        <button data-fluid-active={section === 'notifications'} className={section === 'notifications' ? 'active' : ''} onClick={() => chooseSection('notifications')}><Bell />消息通知</button>
+        <button data-fluid-active={section === 'data'} className={section === 'data' ? 'active' : ''} onClick={() => chooseSection('data')}><Database />账户与数据</button>
       </nav>
       <div className="settings-stage">
       {section === 'appearance' && <section className="settings-content">
-        <div className="setting-group"><h2>外观</h2><p>选择应用的显示方式。</p>
+        <div className="setting-group appearance-shell">
+          <div className="appearance-heading">
+            <span><Sparkles /></span>
+            <div><h2>界面风格</h2><p>在熟悉的经典界面和全新的液态玻璃界面之间自由切换。</p></div>
+          </div>
+          <div className="interface-options">
+            <button className={preferences.interfaceStyle === 'glass' ? 'selected' : ''} onClick={() => patchPreference({ interfaceStyle: 'glass' })}>
+              <div className="interface-preview glass-preview"><i /><span><b /><b /><b /></span><em /></div>
+              <span><strong><Sparkles />液态玻璃</strong><small>通透、轻盈、圆润</small></span>
+              {preferences.interfaceStyle === 'glass' && <i className="option-check"><Check /></i>}
+            </button>
+            <button className={preferences.interfaceStyle === 'classic' ? 'selected' : ''} onClick={() => patchPreference({ interfaceStyle: 'classic' })}>
+              <div className="interface-preview classic-preview"><i /><span><b /><b /><b /></span><em /></div>
+              <span><strong><Layers />经典界面</strong><small>清晰、紧凑、稳重</small></span>
+              {preferences.interfaceStyle === 'classic' && <i className="option-check"><Check /></i>}
+            </button>
+          </div>
+          <div className="surface-opacity-settings">
+            <header>
+              <Droplets />
+              <div><strong>界面透明度</strong><span>同时作用于经典与液态玻璃界面的主要表面，最低保留 20% 以保证可读性。</span></div>
+            </header>
+            <div>
+              <AppearanceOpacityControl label="顶栏" value={preferences.topBarOpacity} onChange={value => patchPreference({ topBarOpacity: value })} />
+              <AppearanceOpacityControl label="导航栏" value={preferences.navigationOpacity} onChange={value => patchPreference({ navigationOpacity: value })} />
+              <AppearanceOpacityControl label="输入框" value={preferences.inputOpacity} onChange={value => patchPreference({ inputOpacity: value })} />
+            </div>
+          </div>
+        </div>
+        <div className="setting-group appearance-colors"><h2>明暗模式</h2><p>选择更适合当前环境的显示方式。</p>
           <div className="theme-options">
             <button className={!dark ? 'selected' : ''} onClick={() => setDark(false)}><div className="theme-preview light"><i /><span /><span /></div><strong><Sun />浅色</strong></button>
             <button className={dark ? 'selected' : ''} onClick={() => setDark(true)}><div className="theme-preview dark"><i /><span /><span /></div><strong><Moon />深色</strong></button>
           </div>
+        </div>
+        <div className="setting-group appearance-colors">
+          <div className="appearance-section-title"><div><h2>主题色</h2><p>选择预设色，或用取色器创建你的专属主题。</p></div><output>{preferences.accentColor}</output></div>
+          <div className="accent-palette">
+            {accentPresets.map(color => <button
+              key={color}
+              className={preferences.accentColor === color ? 'selected' : ''}
+              style={{ '--swatch': color } as CSSProperties}
+              onClick={() => patchPreference({ accentColor: color })}
+              aria-label={`选择主题色 ${color}`}
+            >{preferences.accentColor === color && <Check />}</button>)}
+            <ColorPicker
+              compact
+              label="主题色"
+              value={preferences.accentColor}
+              accentColor={preferences.accentColor}
+              dark={dark}
+              glass={preferences.interfaceStyle === 'glass'}
+              onChange={color => patchPreference({ accentColor: color })}
+            />
+          </div>
+        </div>
+        <div className="setting-group bubble-customizer">
+          <div className="appearance-section-title"><div><h2>聊天气泡</h2><p>点击预览中的气泡，调整对应一侧的颜色与透明度。</p></div></div>
+          <div className="bubble-preview-card">
+            <header className="bubble-preview-header">
+              <span><MessageCircle />即时预览</span>
+              <small>点击气泡进行设置</small>
+            </header>
+            <div className="bubble-chat-preview" aria-label="聊天气泡样式预览">
+              <ColorPicker
+                label="对方 / AI 气泡"
+                triggerClassName="demo-bubble them"
+                triggerAriaLabel="设置对方 / AI 气泡"
+                triggerContent="这个配色看起来很舒服。"
+                value={preferences.theirBubbleColor}
+                opacity={preferences.theirBubbleOpacity}
+                accentColor={preferences.accentColor}
+                dark={dark}
+                glass={preferences.interfaceStyle === 'glass'}
+                onChange={(color, opacity) => patchPreference({
+                  theirBubbleColor: color,
+                  theirBubbleOpacity: opacity ?? preferences.theirBubbleOpacity,
+                })}
+              />
+              <ColorPicker
+                label="我的气泡"
+                triggerClassName="demo-bubble me"
+                triggerAriaLabel="设置我的气泡"
+                triggerContent="就用这套吧！"
+                value={preferences.myBubbleColor}
+                opacity={preferences.myBubbleOpacity}
+                accentColor={preferences.accentColor}
+                dark={dark}
+                glass={preferences.interfaceStyle === 'glass'}
+                onChange={(color, opacity) => patchPreference({
+                  myBubbleColor: color,
+                  myBubbleOpacity: opacity ?? preferences.myBubbleOpacity,
+                })}
+              />
+            </div>
+          </div>
+          <button className="appearance-reset" onClick={() => {
+            patchPreference({
+              interfaceStyle: defaultAppPreferences.interfaceStyle,
+              accentColor: defaultAppPreferences.accentColor,
+              myBubbleColor: defaultAppPreferences.myBubbleColor,
+              theirBubbleColor: defaultAppPreferences.theirBubbleColor,
+              myBubbleOpacity: defaultAppPreferences.myBubbleOpacity,
+              theirBubbleOpacity: defaultAppPreferences.theirBubbleOpacity,
+              topBarOpacity: defaultAppPreferences.topBarOpacity,
+              navigationOpacity: defaultAppPreferences.navigationOpacity,
+              inputOpacity: defaultAppPreferences.inputOpacity,
+            })
+          }}><RotateCcw />恢复默认外观</button>
         </div>
       </section>}
       {section === 'chat' && <section className="settings-content">
@@ -203,12 +521,12 @@ function emptyRole(): Role {
 export default function App() {
   const [page, setPage] = useState<Page>('chat')
   const [selectedId, setSelectedId] = useState<number | null>(null)
-  const [dark, setDark] = useState(false)
   const [roleEditor, setRoleEditor] = useState(false)
   const [draftRole, setDraftRole] = useState<Role | null>(null)
   const [mobileConversations, setMobileConversations] = useState(() => window.matchMedia('(max-width: 820px)').matches)
   const [messages, setAllMessages] = useState<Record<number, Message[]>>({})
   const [preferences, setPreferences] = useState(loadAppPreferences)
+  const outlineHighlightRef = useOutlineHighlight(preferences.interfaceStyle === 'glass')
   const [roles, setRoles] = useState<Role[]>(() => {
     try {
       const stored = JSON.parse(localStorage.getItem('mchat2-roles') ?? '[]') as Role[]
@@ -219,6 +537,8 @@ export default function App() {
   })
 
   const selectedRole = useMemo(() => roles.find(role => role.id === selectedId) ?? null, [roles, selectedId])
+  const dark = preferences.colorMode === 'dark'
+  const setDark = (value: boolean) => setPreferences(current => ({ ...current, colorMode: value ? 'dark' : 'light' }))
   // 当前正在“对应聊天界面”查看的会话 id；不在该界面时为 null，收到回复即计入未读。
   const activeConversationRef = useRef<number | null>(null)
 
@@ -286,12 +606,13 @@ export default function App() {
     // 已在目标界面且无待关闭的编辑/草稿、列表显隐也不变时，视为无变化，跳过动画。
     const nextMobileConversations = next === 'chat' ? true : mobileConversations
     if (page === next && !roleEditor && !draftRole && mobileConversations === nextMobileConversations) return
-    runViewTransition(() => {
+    const updatePage = () => {
       if (next === 'chat') setMobileConversations(true)
       setPage(next)
       setRoleEditor(false)
       setDraftRole(null)
-    }, next === 'settings' ? 'forward' : 'back')
+    }
+    runViewTransition(updatePage, next === 'settings' ? 'forward' : 'back')
   }
 
   const updateRole = (changes: EditableRole) => {
@@ -344,10 +665,12 @@ export default function App() {
     }
 
     if (page === 'settings') {
-      runViewTransition(() => {
+      const returnToChat = () => {
+        releaseActiveFocus()
         setPage('chat')
         setMobileConversations(true)
-      }, 'back')
+      }
+      runViewTransition(returnToChat, 'back')
       return true
     }
 
@@ -527,10 +850,45 @@ export default function App() {
   }
 
   const editorRole = draftRole ?? selectedRole
+  const appBackground = selectedRole?.background
   // 聊天分支始终挂载（切到设置只用 CSS 隐藏），使进行中的回复 / 记忆任务不被卸载打断。
-  const appClass = ['app', dark ? 'dark-mode' : '', page === 'chat' && !mobileConversations ? 'chat-open' : '', page === 'settings' ? 'viewing-settings' : ''].filter(Boolean).join(' ')
+  const appClass = [
+    'app',
+    dark ? 'dark-mode' : '',
+    preferences.interfaceStyle === 'glass' ? 'glass-ui' : 'classic-ui',
+    appBackground?.image ? 'has-app-background' : '',
+    page === 'chat' && !mobileConversations ? 'chat-open' : '',
+    page === 'settings' ? 'viewing-settings' : '',
+  ].filter(Boolean).join(' ')
+  const appStyle = {
+    '--accent': preferences.accentColor,
+    '--accent-ink': accentInk(preferences.accentColor),
+    '--accent-2': colorWithOpacity(preferences.accentColor, dark ? 22 : 12),
+    '--bubble-me-custom': colorWithOpacity(preferences.myBubbleColor, preferences.myBubbleOpacity),
+    '--bubble-them-custom': colorWithOpacity(preferences.theirBubbleColor, preferences.theirBubbleOpacity),
+    '--bubble-me-ink': bubbleInk(preferences.myBubbleColor, preferences.myBubbleOpacity, dark),
+    '--bubble-them-ink': bubbleInk(preferences.theirBubbleColor, preferences.theirBubbleOpacity, dark),
+    '--topbar-surface': colorWithOpacity(dark ? '#313341' : '#FFFFFF', preferences.topBarOpacity),
+    '--navigation-surface': colorWithOpacity(dark ? '#1D1F2A' : '#FFFFFF', preferences.navigationOpacity),
+    '--input-surface': colorWithOpacity(dark ? '#1D1F2A' : '#FFFFFF', preferences.inputOpacity),
+  } as CSSProperties
 
-  return <div className={appClass}>
+  return <div ref={outlineHighlightRef} className={appClass} style={appStyle}>
+    {appBackground?.image && <div className="app-background" aria-hidden="true">
+      <img
+        className="app-background-fill"
+        src={appBackground.image}
+        alt=""
+        style={{ filter: `blur(${Math.max(14, appBackground.blur + 10)}px)` }}
+      />
+      <img
+        className="app-background-focus"
+        src={appBackground.image}
+        alt=""
+        style={{ filter: `blur(${appBackground.blur}px)` }}
+      />
+      <i style={{ opacity: appBackground.overlay / 100 }} />
+    </div>}
     <Rail page={page} setPage={navigate} dark={dark} setDark={setDark} userName={preferences.userName} userAvatar={preferences.userAvatar} />
     <>
       <ConversationList
@@ -572,4 +930,3 @@ export default function App() {
     <DebugOverlay />
   </div>
 }
-

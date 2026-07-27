@@ -1,4 +1,4 @@
-import { useState, type CSSProperties } from 'react'
+import { useState } from 'react'
 import { CheckCircle2, ChevronDown, ChevronUp, Eye, EyeOff, ListRestart, LoaderCircle, MessageSquare, PlugZap, Save } from 'lucide-react'
 import {
   fetchModelList, loadModelConfig, saveModelConfig, testModelConnection,
@@ -6,6 +6,7 @@ import {
 } from './ai-service'
 import { ModelPicker } from './ModelPicker'
 import { loadMemoryModelConfig, saveMemoryModelConfig, type MemoryModelConfig } from './preferences'
+import { rangeProgressStyle } from './range-style'
 
 export function ModelSettings() {
   const [config, setConfig] = useState<ModelConfig>(loadModelConfig)
@@ -68,9 +69,9 @@ export function ModelSettings() {
     }
   }
 
-  const temperatureStyle = { '--range-progress': `${config.temperature / 2 * 100}%` } as CSSProperties
-  const memoryTemperatureStyle = { '--range-progress': `${memoryConfig.temperature / 2 * 100}%` } as CSSProperties
-  const contextCountStyle = { '--range-progress': `${(config.contextMessageCount - 10) / 110 * 100}%` } as CSSProperties
+  const temperatureStyle = rangeProgressStyle(config.temperature, 0, 2)
+  const memoryTemperatureStyle = rangeProgressStyle(memoryConfig.temperature, 0, 2)
+  const contextCountStyle = rangeProgressStyle(config.contextMessageCount, 10, 120)
   const usesCustomMemoryModel = Boolean(memoryConfig.baseUrl.trim() || memoryConfig.apiKey.trim() || memoryConfig.model.trim())
 
   return <div className="model-settings">

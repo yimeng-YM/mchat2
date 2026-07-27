@@ -1,6 +1,7 @@
 import { MessageSquareMore, TimerReset } from 'lucide-react'
-import { useState, type CSSProperties } from 'react'
+import { useState } from 'react'
 import { loadModelConfig, saveModelConfig, type ModelConfig } from './ai-service'
+import { rangeProgressStyle } from './range-style'
 
 export function QueueSettings() {
   const [config, setConfig] = useState<ModelConfig>(loadModelConfig)
@@ -12,7 +13,7 @@ export function QueueSettings() {
       return next
     })
   }
-  const queueDelayStyle = { '--range-progress': `${(config.queueDelaySeconds - 1) / 14 * 100}%` } as CSSProperties
+  const queueDelayStyle = rangeProgressStyle(config.queueDelaySeconds, 1, 15)
 
   return <div className="queue-settings chat-queue-settings">
     <div className="queue-settings-heading">

@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type PointerEvent } from 'react'
 import { Check, RotateCcw, X } from 'lucide-react'
 import { useNativeBackDismiss } from './native-back'
 import { OverlayPortal } from './OverlayPortal'
+import { rangeProgressStyle } from './range-style'
 
 const STAGE_SIZE = 280
 const OUTPUT_SIZE = 512
@@ -89,7 +90,7 @@ export function AvatarCropper({ file, onCancel, onConfirm }: {
 
   const renderedWidth = imageInfo ? imageInfo.width * baseScale : STAGE_SIZE
   const renderedHeight = imageInfo ? imageInfo.height * baseScale : STAGE_SIZE
-  const zoomStyle = { '--range-progress': `${(zoom - 1) / 2 * 100}%` } as CSSProperties
+  const zoomStyle = rangeProgressStyle(zoom, 1, 3)
 
   return <OverlayPortal><div className="crop-overlay" role="dialog" aria-modal="true" aria-labelledby="crop-title">
     <section className="crop-dialog">

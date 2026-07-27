@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Archive, ArchiveRestore, Camera, ChevronDown, FolderOpen, Image, Pencil, Plus, Save, Star, Trash2, Wallpaper, X,
 } from 'lucide-react'
@@ -13,6 +13,7 @@ import {
   type EmojiAsset, type StoredMemory,
 } from './data-library'
 import type { Memory } from './chat-types'
+import { rangeProgressStyle } from './range-style'
 import { runViewTransition } from './view-transitions'
 
 export type EditableRole = {
@@ -206,12 +207,8 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
     if (memoryFilter === 'archived') return Boolean(memory.archived)
     return true
   })
-  const backgroundBlurStyle = {
-    '--range-progress': `${background ? background.blur / 20 * 100 : 0}%`,
-  } as CSSProperties
-  const backgroundOverlayStyle = {
-    '--range-progress': `${background ? background.overlay / 85 * 100 : 0}%`,
-  } as CSSProperties
+  const backgroundBlurStyle = rangeProgressStyle(background?.blur ?? 0, 0, 20)
+  const backgroundOverlayStyle = rangeProgressStyle(background?.overlay ?? 0, 0, 85)
 
   return <aside className="role-editor-panel">
     <header><div><span>角色编辑</span><small>直接影响当前对话</small></div><button className="icon-btn" onClick={onClose} aria-label="关闭角色编辑"><X /></button></header>
@@ -223,9 +220,14 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
       {notice && <p className="role-notice">{notice}</p>}
 
       <section className="role-background-section">
-        <div className="role-background-heading"><div><h3>聊天背景</h3><p>仅应用于当前角色</p></div><button className="secondary compact import-action" onClick={() => backgroundInput.current?.click()}><Wallpaper />{background?.image ? '更换背景' : '导入背景'}</button><input ref={backgroundInput} hidden type="file" accept="image/*" onChange={event => importBackground(event.target.files?.[0])} /></div>
+        <div className="role-background-heading"><div><h3>聊天背景</h3><p>手机端用于聊天，玻璃主题桌面端覆盖整页</p></div><button className="secondary compact import-action" onClick={() => backgroundInput.current?.click()}><Wallpaper />{background?.image ? '更换背景' : '导入背景'}</button><input ref={backgroundInput} hidden type="file" accept="image/*" onChange={event => importBackground(event.target.files?.[0])} /></div>
         {background?.image ? <div className="background-editor">
-          <div className="background-preview"><img src={background.image} alt="聊天背景预览" style={{ filter: `blur(${background.blur}px)`, transform: `scale(${1 + background.blur / 100})` }} /><i style={{ opacity: background.overlay / 100 }} /></div>
+          <div className="background-preview">
+            <img className="background-preview-fill" src={background.image} alt="" style={{ filter: `blur(${Math.max(10, background.blur + 6)}px)` }} />
+            <img className="background-preview-focus" src={background.image} alt="聊天背景预览" style={{ filter: `blur(${background.blur}px)` }} />
+            <i style={{ opacity: background.overlay / 100 }} />
+            <b>桌面整页预览</b>
+          </div>
           <label><span>模糊度</span><input className="range-input" style={backgroundBlurStyle} type="range" min="0" max="20" step="1" value={background.blur} onChange={event => setBackground(current => current ? { ...current, blur: Number(event.target.value) } : current)} /><output>{background.blur}</output></label>
           <label><span>遮罩强度</span><input className="range-input" style={backgroundOverlayStyle} type="range" min="0" max="85" step="1" value={background.overlay} onChange={event => setBackground(current => current ? { ...current, overlay: Number(event.target.value) } : current)} /><output>{background.overlay}%</output></label>
           <button className="text-danger" onClick={() => setBackground(undefined)}><Trash2 />移除聊天背景</button>

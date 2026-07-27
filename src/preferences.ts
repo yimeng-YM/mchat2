@@ -6,6 +6,16 @@ export type MemoryModelConfig = {
 }
 
 export type AppPreferences = {
+  colorMode: 'light' | 'dark'
+  interfaceStyle: 'classic' | 'glass'
+  accentColor: string
+  myBubbleColor: string
+  theirBubbleColor: string
+  myBubbleOpacity: number
+  theirBubbleOpacity: number
+  topBarOpacity: number
+  navigationOpacity: number
+  inputOpacity: number
   typingStatus: boolean
   messageSound: boolean
   notificationsEnabled: boolean
@@ -19,6 +29,16 @@ const STORAGE_KEY = 'mchat2-app-preferences'
 export const MAX_MEMORY_EXTRACTION_INTERVAL = 20
 
 export const defaultAppPreferences: AppPreferences = {
+  colorMode: 'light',
+  interfaceStyle: 'glass',
+  accentColor: '#6D5DFB',
+  myBubbleColor: '#6D5DFB',
+  theirBubbleColor: '#FFFFFF',
+  myBubbleOpacity: 78,
+  theirBubbleOpacity: 78,
+  topBarOpacity: 54,
+  navigationOpacity: 64,
+  inputOpacity: 68,
   typingStatus: true,
   messageSound: false,
   notificationsEnabled: false,
@@ -30,8 +50,27 @@ export const defaultAppPreferences: AppPreferences = {
 
 export function loadAppPreferences(): AppPreferences {
   try {
-    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as Partial<AppPreferences>
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as Partial<AppPreferences> & {
+      bubbleOpacity?: number
+    }
+    const validColor = (value: unknown, fallback: string) =>
+      typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value) ? value.toUpperCase() : fallback
+    const validOpacity = (value: unknown, fallback: number) =>
+      Number.isFinite(value) ? Math.max(0, Math.min(100, Math.round(value as number))) : fallback
+    const validSurfaceOpacity = (value: unknown, fallback: number) =>
+      Number.isFinite(value) ? Math.max(20, Math.min(100, Math.round(value as number))) : fallback
+    const legacyBubbleOpacity = validOpacity(stored.bubbleOpacity, defaultAppPreferences.myBubbleOpacity)
     return {
+      colorMode: stored.colorMode === 'dark' ? 'dark' : defaultAppPreferences.colorMode,
+      interfaceStyle: stored.interfaceStyle === 'classic' ? 'classic' : defaultAppPreferences.interfaceStyle,
+      accentColor: validColor(stored.accentColor, defaultAppPreferences.accentColor),
+      myBubbleColor: validColor(stored.myBubbleColor, defaultAppPreferences.myBubbleColor),
+      theirBubbleColor: validColor(stored.theirBubbleColor, defaultAppPreferences.theirBubbleColor),
+      myBubbleOpacity: validOpacity(stored.myBubbleOpacity, legacyBubbleOpacity),
+      theirBubbleOpacity: validOpacity(stored.theirBubbleOpacity, legacyBubbleOpacity),
+      topBarOpacity: validSurfaceOpacity(stored.topBarOpacity, defaultAppPreferences.topBarOpacity),
+      navigationOpacity: validSurfaceOpacity(stored.navigationOpacity, defaultAppPreferences.navigationOpacity),
+      inputOpacity: validSurfaceOpacity(stored.inputOpacity, defaultAppPreferences.inputOpacity),
       typingStatus: stored.typingStatus ?? defaultAppPreferences.typingStatus,
       messageSound: stored.messageSound ?? defaultAppPreferences.messageSound,
       notificationsEnabled: stored.notificationsEnabled ?? defaultAppPreferences.notificationsEnabled,
