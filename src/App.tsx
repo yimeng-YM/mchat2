@@ -14,7 +14,7 @@ import { ModelSettings } from './ModelSettings'
 import { QueueSettings } from './QueueSettings'
 import { RoleEditorPanel, type EditableRole } from './RoleEditorPanel'
 import {
-  loadConversation, removeLegacyDefaultData, removeRoleData, replaceConversationGroup,
+  loadConversation, normalizeArchivedRole, removeLegacyDefaultData, removeRoleData, replaceConversationGroup,
   saveConversationMessages, updateConversationMessages,
 } from './data-library'
 import {
@@ -112,13 +112,14 @@ function Toggle({ label, checked, onChange, disabled = false }: {
   ><i /></button>
 }
 
-function SettingsPage({ dark, setDark, roles, preferences, setPreferences, onDataChanged }: {
+function SettingsPage({ dark, setDark, roles, preferences, setPreferences, onDataChanged, onRolesImported }: {
   dark: boolean
   setDark: (value: boolean) => void
   roles: Role[]
   preferences: AppPreferences
   setPreferences: (preferences: AppPreferences) => void
   onDataChanged: () => Promise<void>
+  onRolesImported: (roles: Role[], orphanRoleIds?: number[]) => Promise<number>
 }) {
   const [section, setSection] = useState<'appearance' | 'chat' | 'model' | 'notifications' | 'data'>('appearance')
   const [notificationNotice, setNotificationNotice] = useState('')
@@ -176,7 +177,7 @@ function SettingsPage({ dark, setDark, roles, preferences, setPreferences, onDat
           {notificationNotice && <p className="setting-warning">{notificationNotice}</p>}
         </div>
       </section>}
-      {section === 'data' && <section className="settings-content"><DataSettings roles={roles} preferences={preferences} onPreferencesChange={setPreferences} onChanged={onDataChanged} /></section>}
+      {section === 'data' && <section className="settings-content"><DataSettings roles={roles} preferences={preferences} onPreferencesChange={setPreferences} onChanged={onDataChanged} onRolesImported={onRolesImported} /></section>}
       </div>
     </div>
   </main>
@@ -257,6 +258,27 @@ export default function App() {
   const reloadSelectedConversation = async () => {
     const conversations = await Promise.all(roles.map(async role => [role.id, await loadConversation(role.id)] as const))
     setAllMessages(previous => ({ ...previous, ...Object.fromEntries(conversations) }))
+  }
+
+  // 导入对话归档时恢复角色：优先用归档自带的角色定义，旧版归档（无角色定义）则按消息里
+  // 出现的 roleId 建占位角色兜底。两种都只补齐本机不存在的角色，不覆盖用户已有编辑。
+  // 返回实际新增的角色数量，供导入提示显示。
+  const restoreImportedRoles = async (imported: Role[], orphanRoleIds: number[] = []): Promise<number> => {
+    const existing = new Set(roles.map(role => role.id))
+    const defined = new Set(imported.map(role => role.id))
+    // 归档没给定义、本机也没有的 roleId，用默认值建占位角色（名字为“角色 #id”，可后续改名）。
+    const placeholders = orphanRoleIds
+      .filter(id => !defined.has(id) && !existing.has(id))
+      .map(id => normalizeArchivedRole({ id }))
+      .filter((role): role is Role => role !== null)
+    const missing = [...imported.filter(role => !existing.has(role.id)), ...placeholders]
+    if (!missing.length) return 0
+    setRoles(current => {
+      const have = new Set(current.map(role => role.id))
+      const toAdd = missing.filter(role => !have.has(role.id))
+      return toAdd.length ? [...toAdd, ...current] : current
+    })
+    return missing.length
   }
 
   const navigate = (next: Page) => {
@@ -545,6 +567,7 @@ export default function App() {
       preferences={preferences}
       setPreferences={setPreferences}
       onDataChanged={reloadSelectedConversation}
+      onRolesImported={restoreImportedRoles}
     />}
     <DebugOverlay />
   </div>

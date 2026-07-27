@@ -3,7 +3,7 @@ import { AlertCircle, ArrowLeft, Bug, Ellipsis, Image as ImageIcon, Mic, Send } 
 import { Avatar } from './Avatar'
 import { ChatMessage } from './ChatMessage'
 import { MessageGroupEditor } from './MessageGroupEditor'
-import { loadModelConfig, requestAiReply } from './ai-service'
+import { loadModelConfig, requestAiReply, MODEL_CONFIG_CHANGED_EVENT } from './ai-service'
 import { parseAssistantReply } from './chat-protocol'
 import { toggleDebugLogging } from './debug-log'
 import { hasNativeDeviceFeatures, pickNativeImage, showReplyNotification, startVoiceInput } from './device-features'
@@ -70,7 +70,8 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
   openEditor: () => void
   onBack: () => void
 }) {
-  const config = useMemo(loadModelConfig, [])
+  // 模型配置需可刷新：ChatView 切到设置时只是隐藏而非卸载，保存设置后要即时生效。
+  const [config, setConfig] = useState(loadModelConfig)
   const [draft, setDraft] = useState('')
   const [typing, setTyping] = useState(false)
   const [sendError, setSendError] = useState('')
@@ -100,6 +101,13 @@ export function ChatView({ role, messages, preferences, appendMessages, updateMe
   useEffect(() => {
     messagesRef.current = messages
   }, [messages])
+
+  // 设置页保存模型配置后重新读取，避免常驻的 ChatView 继续使用过期配置。
+  useEffect(() => {
+    const reload = () => setConfig(loadModelConfig())
+    window.addEventListener(MODEL_CONFIG_CHANGED_EVENT, reload)
+    return () => window.removeEventListener(MODEL_CONFIG_CHANGED_EVENT, reload)
+  }, [])
 
   useEffect(() => {
     let cancelled = false

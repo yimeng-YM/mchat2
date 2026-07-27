@@ -87,11 +87,15 @@ export async function extractMemoriesFromConversation(
         .join('\n')
     : '当前没有已有记忆'
 
-  const conversationLimit = Math.max(1, memoryConfig.contextMessageCount - 2)
+  // 预留两条前置说明 + 一条末尾任务指令，剩余额度留给真实对话。
+  const conversationLimit = Math.max(1, memoryConfig.contextMessageCount - 3)
   const contextMessages: AiMessage[] = [
     { from: 'me', text: `以下内容用于维护你（${role.name}）记录的、关于对方的长期记忆。` },
     { from: 'me', text: `已有记忆：\n${existingMemoriesText}` },
     ...recentConversation.slice(-conversationLimit),
+    // 末尾必须是用户发言：既给出明确任务，又避免请求以 assistant 结尾——
+    // 后者会被严格的 OpenAI 兼容服务拒绝，导致首次提取失败、只能靠重试补一条 user。
+    { from: 'me', text: '请根据以上对话和已有记忆完成长期记忆维护，严格只返回约定的 JSON 对象。' },
   ]
 
   try {

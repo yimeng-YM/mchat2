@@ -58,6 +58,9 @@ export type AiMessage = {
 
 const STORAGE_KEY = 'mchat2-model-config'
 
+// 保存模型配置后广播，供常驻挂载的界面（如 ChatView）实时刷新，避免使用过期配置。
+export const MODEL_CONFIG_CHANGED_EVENT = 'mchat2:model-config-changed'
+
 export const defaultModelConfig: ModelConfig = {
   baseUrl: 'https://api.openai.com/v1',
   apiKey: '',
@@ -95,6 +98,7 @@ export function loadModelConfig(): ModelConfig {
 
 export function saveModelConfig(config: ModelConfig) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(config))
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event(MODEL_CONFIG_CHANGED_EVENT))
 }
 
 function chatEndpoint(baseUrl: string) {
@@ -237,13 +241,17 @@ export async function requestStructuredAiReply(
   if (!config.model.trim()) throw new Error('请先填写模型名称')
   const temperature = Number.isFinite(config.temperature) ? Math.min(2, Math.max(0, config.temperature)) : defaultModelConfig.temperature
   const maxTokens = Number.isFinite(config.maxTokens) ? Math.max(1, Math.round(config.maxTokens)) : defaultModelConfig.maxTokens
-  const conversation = history
-    .slice(-Math.max(1, Math.round(config.contextMessageCount)))
-    .map(message => ({
-      role: message.from === 'me' ? 'user' as const : 'assistant' as const,
-      content: serializedMessage(message),
-    }))
-    .filter(message => message.content.length > 0)
+  // 合并相邻同角色消息，保证角色严格交替；否则调用方拼接的多条 user 说明会形成
+  // 连续 user，严格的 OpenAI 兼容服务会拒绝这类请求。
+  const conversation: Array<{ role: 'user' | 'assistant'; content: string }> = []
+  for (const message of history.slice(-Math.max(1, Math.round(config.contextMessageCount)))) {
+    const content = serializedMessage(message)
+    if (!content) continue
+    const role = message.from === 'me' ? 'user' as const : 'assistant' as const
+    const previous = conversation[conversation.length - 1]
+    if (previous?.role === role) previous.content += `\n${content}`
+    else conversation.push({ role, content })
+  }
 
   const response = await loggedRequest('结构化请求（记忆等）', {
     url: chatEndpoint(config.baseUrl),

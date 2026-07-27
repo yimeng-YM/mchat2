@@ -2,7 +2,11 @@
 import { Capacitor, registerPlugin } from '@capacitor/core'
 import { removeNativeRoleFiles } from './device-features'
 import { MEMORY_CATEGORIES } from './chat-types'
-import type { ChatAttachment, Message, Memory, MemoryInput } from './chat-types'
+import type { ChatAttachment, Message, Memory, MemoryInput, Role } from './chat-types'
+
+// 角色信息保存在 localStorage（由 App 维护），对话/记忆保存在 IndexedDB。
+// 导出对话归档时需一并带上角色定义，否则换设备导入后消息会成为“孤儿数据”。
+export const ROLES_STORAGE_KEY = 'mchat2-roles'
 
 export type StoredMessage = {
   key: string
@@ -87,6 +91,8 @@ interface LargeMediaPlugin {
   saveTextExport(options: { token: string; name: string }): Promise<{ saved: boolean }>
   exportRolePack(options: { roleId: number; name: string }): Promise<{ exported: number; saved: boolean }>
   removeRole(options: { roleId: number }): Promise<void>
+  assembleBackup(options: { convToken: string; memToken: string; manifest: string; roleIds: number[] | null; name: string }): Promise<{ saved: boolean; emojis: number }>
+  pickBackup(): Promise<{ restored: boolean; conversationsPath?: string; memoriesPath?: string; emojis?: number }>
 }
 
 const nativeMedia = registerPlugin<LargeMediaPlugin>('LargeMedia')
@@ -225,6 +231,49 @@ async function putMessageBatch(batch: StoredMessage[]) {
   await libraryDb.messages.bulkPut(batch)
 }
 
+function readStoredRoles(): Role[] {
+  try {
+    const stored = JSON.parse(localStorage.getItem(ROLES_STORAGE_KEY) ?? '[]')
+    return Array.isArray(stored) ? stored as Role[] : []
+  } catch {
+    return []
+  }
+}
+
+// 把归档里的原始角色数据规范成完整 Role，缺失字段用安全默认值补齐。
+export function normalizeArchivedRole(raw: Partial<Role> & { id: unknown }): Role | null {
+  const id = Number(raw.id)
+  if (!Number.isFinite(id) || !id) return null
+  return {
+    id,
+    name: typeof raw.name === 'string' && raw.name.trim() ? raw.name : `角色 #${id}`,
+    avatar: typeof raw.avatar === 'string' && raw.avatar ? raw.avatar : '/avatars/default-role.svg',
+    signature: typeof raw.signature === 'string' ? raw.signature : '',
+    relation: typeof raw.relation === 'string' ? raw.relation : '',
+    status: typeof raw.status === 'string' ? raw.status : '',
+    tags: Array.isArray(raw.tags) ? raw.tags.filter((tag): tag is string => typeof tag === 'string') : [],
+    unread: 0,
+    last: typeof raw.last === 'string' ? raw.last : '',
+    time: typeof raw.time === 'string' ? raw.time : '',
+    online: typeof raw.online === 'boolean' ? raw.online : true,
+    persona: typeof raw.persona === 'string' ? raw.persona : '',
+    background: raw.background && typeof raw.background === 'object'
+      ? {
+          image: typeof raw.background.image === 'string' ? raw.background.image : '',
+          blur: Number.isFinite(Number(raw.background.blur)) ? Number(raw.background.blur) : 0,
+          overlay: Number.isFinite(Number(raw.background.overlay)) ? Number(raw.background.overlay) : 0,
+        }
+      : undefined,
+  }
+}
+
+// 生成归档中的角色行（每行一个 {type:'mchat2-role', ...Role}），按所选角色过滤。
+function buildRoleChunk(selectedRoleIds?: number[]): string {
+  const selected = selectedRoleIds?.length ? new Set(selectedRoleIds) : null
+  const roles = readStoredRoles().filter(role => !selected || selected.has(role.id))
+  return roles.map(role => `${JSON.stringify({ type: 'mchat2-role', ...role })}\n`).join('')
+}
+
 export async function inspectConversationArchive(file: File) {
   const reader = file.stream().getReader()
   const decoder = new TextDecoder()
@@ -234,7 +283,7 @@ export async function inspectConversationArchive(file: File) {
     const line = rawLine.trim()
     if (!line) return
     const item = JSON.parse(line) as Partial<StoredMessage> & { type?: string }
-    if (item.type === 'mchat2-archive') return
+    if (item.type === 'mchat2-archive' || item.type === 'mchat2-role') return
     const roleId = Number(item.roleId)
     if (!roleId || !item.text || (item.from !== 'me' && item.from !== 'them')) throw new Error('归档中包含无效的对话记录')
     counts[roleId] = (counts[roleId] ?? 0) + 1
@@ -261,15 +310,23 @@ export async function importConversationArchive(file: File, onProgress: (progres
   let processed = 0
   let scanned = 0
   let batch: StoredMessage[] = []
+  const roles: Role[] = []
+  const messageRoleIds = new Set<number>()
 
   const consumeLine = async (rawLine: string) => {
     const line = rawLine.trim()
     if (!line) return
     const item = JSON.parse(line) as Partial<StoredMessage> & { type?: string }
     if (item.type === 'mchat2-archive') return
+    if (item.type === 'mchat2-role') {
+      const role = normalizeArchivedRole(item as unknown as Partial<Role> & { id: unknown })
+      if (role && (!selected || selected.has(role.id))) roles.push(role)
+      return
+    }
     scanned += 1
     if (!item.roleId || !item.text || (item.from !== 'me' && item.from !== 'them')) throw new Error(`第 ${scanned} 行不是有效的对话记录`)
     if (selected && !selected.has(Number(item.roleId))) return
+    messageRoleIds.add(Number(item.roleId))
     const messageId = Number(item.messageId ?? Date.now() + processed)
     batch.push({
       key: `${item.roleId}:${messageId}`,
@@ -306,13 +363,18 @@ export async function importConversationArchive(file: File, onProgress: (progres
   if (buffer.trim()) await consumeLine(buffer)
   await putMessageBatch(batch)
   onProgress({ processed, total: processed, bytes })
-  return processed
+  // 归档里没有对应角色定义、但消息引用了的 roleId（旧版 v1 归档会走到这里），交给上层兜底建占位角色。
+  const definedIds = new Set(roles.map(role => role.id))
+  const orphanRoleIds = [...messageRoleIds].filter(id => !definedIds.has(id))
+  return { processed, roles, orphanRoleIds }
 }
 
 async function writeArchiveToStream(writer: WritableStreamDefaultWriter<Uint8Array>, selectedRoleIds?: number[]) {
   const encoder = new TextEncoder()
   const selected = selectedRoleIds?.length ? new Set(selectedRoleIds) : null
-  await writer.write(encoder.encode(`${JSON.stringify({ type: 'mchat2-archive', version: 1 })}\n`))
+  await writer.write(encoder.encode(`${JSON.stringify({ type: 'mchat2-archive', version: 2 })}\n`))
+  const roleChunk = buildRoleChunk(selectedRoleIds)
+  if (roleChunk) await writer.write(encoder.encode(roleChunk))
   let offset = 0
   while (true) {
     const rows = await libraryDb.messages.orderBy('createdAt').offset(offset).limit(500).toArray()
@@ -327,7 +389,9 @@ export async function exportConversationArchive(selectedRoleIds?: number[]) {
   const archiveName = `MChat2-对话记录-${new Date().toISOString().slice(0, 10)}.ndjson`
   if (hasNativeMediaLibrary()) {
     const { token } = await nativeMedia.beginTextExport({ name: archiveName })
-    await nativeMedia.appendTextExport({ token, chunk: `${JSON.stringify({ type: 'mchat2-archive', version: 1 })}\n` })
+    await nativeMedia.appendTextExport({ token, chunk: `${JSON.stringify({ type: 'mchat2-archive', version: 2 })}\n` })
+    const roleChunk = buildRoleChunk(selectedRoleIds)
+    if (roleChunk) await nativeMedia.appendTextExport({ token, chunk: roleChunk })
     let offset = 0
     while (true) {
       const rows = await libraryDb.messages.orderBy('createdAt').offset(offset).limit(500).toArray()
@@ -350,7 +414,9 @@ export async function exportConversationArchive(selectedRoleIds?: number[]) {
     return
   }
 
-  const chunks: BlobPart[] = [`${JSON.stringify({ type: 'mchat2-archive', version: 1 })}\n`]
+  const chunks: BlobPart[] = [`${JSON.stringify({ type: 'mchat2-archive', version: 2 })}\n`]
+  const roleChunk = buildRoleChunk(selectedRoleIds)
+  if (roleChunk) chunks.push(roleChunk)
   const selected = selectedRoleIds?.length ? new Set(selectedRoleIds) : null
   await libraryDb.messages.orderBy('createdAt').each(row => { if (!selected || selected.has(row.roleId)) chunks.push(`${JSON.stringify(row)}\n`) })
   const url = URL.createObjectURL(new Blob(chunks, { type: 'application/x-ndjson' }))
@@ -670,4 +736,78 @@ export async function exportMemoryArchive(selectedRoleIds?: number[]) {
   anchor.download = archiveName
   anchor.click()
   setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+// ——— 完整备份（对话 + 角色/提示词 + 长期记忆 + 表情包，打进一个 zip，仅原生可用） ———
+
+export type FullBackupResult = {
+  processed: number
+  memoriesImported: number
+  emojis: number
+  roles: Role[]
+  orphanRoleIds: number[]
+}
+
+// 把对话归档（含角色定义）分块写进原生文本导出 token，格式与 exportConversationArchive 一致。
+async function writeConversationsToToken(token: string, selectedRoleIds?: number[]) {
+  await nativeMedia.appendTextExport({ token, chunk: `${JSON.stringify({ type: 'mchat2-archive', version: 2 })}\n` })
+  const roleChunk = buildRoleChunk(selectedRoleIds)
+  if (roleChunk) await nativeMedia.appendTextExport({ token, chunk: roleChunk })
+  const selected = selectedRoleIds?.length ? new Set(selectedRoleIds) : null
+  let offset = 0
+  while (true) {
+    const rows = await libraryDb.messages.orderBy('createdAt').offset(offset).limit(500).toArray()
+    if (!rows.length) break
+    const selectedRows = selected ? rows.filter(row => selected.has(row.roleId)) : rows
+    if (selectedRows.length) await nativeMedia.appendTextExport({ token, chunk: selectedRows.map(row => JSON.stringify(row)).join('\n') + '\n' })
+    offset += rows.length
+  }
+}
+
+// 把长期记忆归档分块写进原生文本导出 token，格式与 exportMemoryArchive 一致。
+async function writeMemoriesToToken(token: string, selectedRoleIds?: number[]) {
+  await nativeMedia.appendTextExport({ token, chunk: `${JSON.stringify({ type: 'mchat2-memory-archive', version: 1 })}\n` })
+  const selected = selectedRoleIds?.length ? new Set(selectedRoleIds) : null
+  const memories = selected
+    ? (await Promise.all([...selected].map(rid => getMemoriesByRole(rid)))).flat()
+    : await libraryDb.memories.toArray()
+  for (let index = 0; index < memories.length; index += 200) {
+    await nativeMedia.appendTextExport({ token, chunk: memories.slice(index, index + 200).map(m => JSON.stringify(m)).join('\n') + '\n' })
+  }
+}
+
+export async function exportFullBackup(selectedRoleIds?: number[]) {
+  if (!hasNativeMediaLibrary()) throw new Error('完整备份仅在 App 内可用')
+  const backupName = `MChat2-完整备份-${new Date().toISOString().slice(0, 10)}.zip`
+  const { token: convToken } = await nativeMedia.beginTextExport({ name: 'conversations.ndjson' })
+  await writeConversationsToToken(convToken, selectedRoleIds)
+  const { token: memToken } = await nativeMedia.beginTextExport({ name: 'memories.ndjson' })
+  await writeMemoriesToToken(memToken, selectedRoleIds)
+  const roleIds = selectedRoleIds?.length ? selectedRoleIds : null
+  const manifest = JSON.stringify({
+    type: 'mchat2-full-backup',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    roleCount: roleIds ? roleIds.length : readStoredRoles().length,
+  })
+  return nativeMedia.assembleBackup({ convToken, memToken, manifest, roleIds, name: backupName })
+}
+
+export async function importFullBackup(onProgress: (progress: ImportProgress) => void): Promise<FullBackupResult | null> {
+  if (!hasNativeMediaLibrary()) throw new Error('完整备份仅在 App 内可用')
+  const picked = await nativeMedia.pickBackup()
+  if (!picked.restored) return null // 用户取消
+  const fetchArchive = async (path?: string) => {
+    if (!path) return null
+    const response = await fetch(Capacitor.convertFileSrc(path))
+    return new File([await response.blob()], 'archive.ndjson')
+  }
+  const conversationsFile = await fetchArchive(picked.conversationsPath)
+  const memoriesFile = await fetchArchive(picked.memoriesPath)
+  // 完整备份统一全量恢复（导出时已按角色筛选过）。
+  const { processed, roles, orphanRoleIds } = conversationsFile
+    ? await importConversationArchive(conversationsFile, onProgress)
+    : { processed: 0, roles: [] as Role[], orphanRoleIds: [] as number[] }
+  const memoriesImported = memoriesFile ? await importMemoryArchive(memoriesFile, onProgress) : 0
+  return { processed, memoriesImported, emojis: picked.emojis ?? 0, roles, orphanRoleIds }
 }

@@ -13,6 +13,8 @@ import android.provider.OpenableColumns;
 
 import androidx.activity.result.ActivityResult;
 
+import org.json.JSONObject;
+
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -28,6 +30,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -303,6 +306,176 @@ public class LargeMediaPlugin extends Plugin {
         });
     }
 
+    // 完整备份：把已写好的对话/记忆临时文件（convToken/memToken）与表情原文件流式打进一个 zip。
+    @PluginMethod
+    public void assembleBackup(PluginCall call) {
+        String convToken = call.getString("convToken", "");
+        String memToken = call.getString("memToken", "");
+        if (!pendingTextExports.containsKey(convToken) || !pendingTextExports.containsKey(memToken)) {
+            call.reject("备份数据已失效，请重试");
+            return;
+        }
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/zip");
+        intent.putExtra(Intent.EXTRA_TITLE, call.getString("name", "MChat2-backup.zip"));
+        startActivityForResult(call, intent, "assembleBackupResult");
+    }
+
+    @ActivityCallback
+    private void assembleBackupResult(PluginCall call, ActivityResult result) {
+        String convToken = call.getString("convToken", "");
+        String memToken = call.getString("memToken", "");
+        File conversations = pendingTextExports.remove(convToken);
+        File memories = pendingTextExports.remove(memToken);
+        if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null || result.getData().getData() == null) {
+            if (conversations != null) conversations.delete();
+            if (memories != null) memories.delete();
+            JSObject response = new JSObject(); response.put("saved", false); response.put("emojis", 0); call.resolve(response);
+            return;
+        }
+        String manifest = call.getString("manifest", "{}");
+        Set<Long> roleFilter = parseRoleFilter(call.getArray("roleIds", null));
+        Uri destination = result.getData().getData();
+        ioExecutor.execute(() -> {
+            try {
+                if (conversations == null || memories == null) throw new IllegalStateException("备份临时文件缺失");
+                OutputStream rawOutput = getContext().getContentResolver().openOutputStream(destination);
+                if (rawOutput == null) throw new IllegalStateException("无法打开保存位置");
+                int emojis;
+                try (ZipOutputStream zip = new ZipOutputStream(rawOutput)) {
+                    writeZipText(zip, "manifest.json", manifest);
+                    writeZipFile(zip, "conversations.ndjson", conversations);
+                    writeZipFile(zip, "memories.ndjson", memories);
+                    emojis = mediaDatabase.exportBackup(zip, roleFilter);
+                }
+                JSObject response = new JSObject();
+                response.put("saved", true);
+                response.put("emojis", emojis);
+                call.resolve(response);
+            } catch (Exception error) {
+                call.reject("生成备份失败", error);
+            } finally {
+                conversations.delete();
+                memories.delete();
+            }
+        });
+    }
+
+    // 完整恢复：选一个备份 zip，流式解压——对话/记忆写到 cache 供 WebView 读取，表情原文件落回表情库目录。
+    @PluginMethod
+    public void pickBackup(PluginCall call) {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"application/zip", "application/x-zip-compressed", "application/octet-stream"});
+        startActivityForResult(call, intent, "pickBackupResult");
+    }
+
+    @ActivityCallback
+    private void pickBackupResult(PluginCall call, ActivityResult result) {
+        if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null || result.getData().getData() == null) {
+            JSObject response = new JSObject(); response.put("restored", false); call.resolve(response);
+            return;
+        }
+        Uri source = result.getData().getData();
+        ioExecutor.execute(() -> {
+            try {
+                File workDir = new File(getContext().getCacheDir(), "restore");
+                deleteRecursively(workDir);
+                if (!workDir.mkdirs()) throw new IllegalStateException("无法创建恢复目录");
+                File conversations = new File(workDir, "conversations.ndjson");
+                File memories = new File(workDir, "memories.ndjson");
+                Map<String, JSONObject> emojiMeta = new HashMap<>();
+                List<String[]> stagedEmojis = new ArrayList<>(); // {roleId, fileId, path}
+
+                InputStream rawInput = getContext().getContentResolver().openInputStream(source);
+                if (rawInput == null) throw new IllegalStateException("无法读取备份文件");
+                try (ZipInputStream zip = new ZipInputStream(rawInput)) {
+                    ZipEntry entry;
+                    byte[] buffer = new byte[1024 * 1024];
+                    while ((entry = zip.getNextEntry()) != null) {
+                        String entryName = entry.getName();
+                        if (entry.isDirectory()) { zip.closeEntry(); continue; }
+                        if ("conversations.ndjson".equals(entryName)) {
+                            writeStreamToFile(zip, conversations, buffer);
+                        } else if ("memories.ndjson".equals(entryName)) {
+                            writeStreamToFile(zip, memories, buffer);
+                        } else if ("emoji-index.ndjson".equals(entryName)) {
+                            readEmojiIndex(zip, emojiMeta);
+                        } else if (entryName.startsWith("emoji/")) {
+                            // emoji/<roleId>/<fileId>
+                            String[] parts = entryName.split("/");
+                            if (parts.length != 3 || parts[1].isEmpty() || parts[2].isEmpty()) { zip.closeEntry(); continue; }
+                            long roleId;
+                            try { roleId = Long.parseLong(parts[1]); } catch (NumberFormatException nfe) { zip.closeEntry(); continue; }
+                            File directory = roleDirectory(roleId);
+                            if (!directory.exists() && !directory.mkdirs()) { zip.closeEntry(); continue; }
+                            File target = new File(directory, parts[2]);
+                            writeStreamToFile(zip, target, buffer);
+                            stagedEmojis.add(new String[]{parts[1], parts[2], target.getAbsolutePath()});
+                        }
+                        zip.closeEntry();
+                    }
+                }
+
+                int restoredEmojis = mediaDatabase.restoreEmojis(stagedEmojis, emojiMeta);
+                JSObject response = new JSObject();
+                response.put("restored", true);
+                // 返回 file:// URI，供 JS 端 Capacitor.convertFileSrc 转成 WebView 可 fetch 的地址。
+                response.put("conversationsPath", conversations.isFile() ? Uri.fromFile(conversations).toString() : "");
+                response.put("memoriesPath", memories.isFile() ? Uri.fromFile(memories).toString() : "");
+                response.put("emojis", restoredEmojis);
+                call.resolve(response);
+            } catch (Exception error) {
+                call.reject("恢复备份失败", error);
+            }
+        });
+    }
+
+    private Set<Long> parseRoleFilter(JSArray roleIds) {
+        if (roleIds == null) return null;
+        Set<Long> filter = new HashSet<>();
+        for (int index = 0; index < roleIds.length(); index++) {
+            long id = roleIds.optLong(index, 0L);
+            if (id > 0) filter.add(id);
+        }
+        return filter.isEmpty() ? null : filter;
+    }
+
+    private void writeZipText(ZipOutputStream zip, String name, String content) throws Exception {
+        zip.putNextEntry(new ZipEntry(name));
+        zip.write(content.getBytes(StandardCharsets.UTF_8));
+        zip.closeEntry();
+    }
+
+    private void writeZipFile(ZipOutputStream zip, String name, File file) throws Exception {
+        zip.putNextEntry(new ZipEntry(name));
+        if (file.isFile()) try (InputStream input = new FileInputStream(file)) { copyStream(input, zip); }
+        zip.closeEntry();
+    }
+
+    private void writeStreamToFile(InputStream input, File target, byte[] buffer) throws Exception {
+        try (FileOutputStream output = new FileOutputStream(target)) {
+            int read;
+            while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
+        }
+    }
+
+    private void readEmojiIndex(InputStream input, Map<String, JSONObject> meta) throws Exception {
+        java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(input, StandardCharsets.UTF_8));
+        String line;
+        while ((line = reader.readLine()) != null) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) continue;
+            try {
+                JSONObject item = new JSONObject(trimmed);
+                String key = item.optLong("roleId") + "/" + item.optString("file");
+                meta.put(key, item);
+            } catch (Exception ignored) {}
+        }
+    }
+
     private File mediaRoot() {
         return new File(getContext().getFilesDir(), "emoji-library");
     }
@@ -524,6 +697,86 @@ public class LargeMediaPlugin extends Plugin {
                 }
             }
             return exported;
+        }
+
+        // 完整备份：先写 emoji-index.ndjson（保留原始名称/mime/时间），再把表情原文件写进 emoji/<roleId>/<fileId>。
+        int exportBackup(ZipOutputStream zip, Set<Long> roleFilter) throws Exception {
+            String selection = null;
+            String[] args = null;
+            if (roleFilter != null && !roleFilter.isEmpty()) {
+                StringBuilder placeholders = new StringBuilder();
+                args = new String[roleFilter.size()];
+                int index = 0;
+                for (Long id : roleFilter) {
+                    placeholders.append(index == 0 ? "?" : ",?");
+                    args[index++] = String.valueOf(id);
+                }
+                selection = "role_id IN (" + placeholders + ")";
+            }
+            List<String[]> files = new ArrayList<>(); // {roleId, fileId, path}
+            zip.putNextEntry(new ZipEntry("emoji-index.ndjson"));
+            try (Cursor cursor = getReadableDatabase().query("media", null, selection, args, null, null, "created_at ASC")) {
+                while (cursor.moveToNext()) {
+                    String id = cursor.getString(cursor.getColumnIndexOrThrow("id"));
+                    long roleId = cursor.getLong(cursor.getColumnIndexOrThrow("role_id"));
+                    File file = new File(cursor.getString(cursor.getColumnIndexOrThrow("path")));
+                    if (!file.isFile()) continue;
+                    JSONObject item = new JSONObject();
+                    item.put("roleId", roleId);
+                    item.put("file", id);
+                    item.put("name", cursor.getString(cursor.getColumnIndexOrThrow("name")));
+                    item.put("mime", cursor.getString(cursor.getColumnIndexOrThrow("mime")));
+                    item.put("size", cursor.getLong(cursor.getColumnIndexOrThrow("size")));
+                    item.put("createdAt", cursor.getLong(cursor.getColumnIndexOrThrow("created_at")));
+                    zip.write((item + "\n").getBytes(StandardCharsets.UTF_8));
+                    files.add(new String[]{String.valueOf(roleId), id, file.getAbsolutePath()});
+                }
+            }
+            zip.closeEntry();
+            int exported = 0;
+            for (String[] entry : files) {
+                File file = new File(entry[2]);
+                if (!file.isFile()) continue;
+                zip.putNextEntry(new ZipEntry("emoji/" + entry[0] + "/" + entry[1]));
+                try (InputStream input = new FileInputStream(file)) { copyStream(input, zip); }
+                zip.closeEntry();
+                exported += 1;
+            }
+            return exported;
+        }
+
+        // 恢复表情：文件已解压到最终目录，这里按 emoji-index 元数据回填 SQLite（缺失则用文件名兜底），冲突则覆盖。
+        int restoreEmojis(List<String[]> staged, Map<String, JSONObject> meta) {
+            if (staged.isEmpty()) return 0;
+            SQLiteDatabase db = getWritableDatabase();
+            int restored = 0;
+            db.beginTransaction();
+            try {
+                for (String[] entry : staged) {
+                    String roleId = entry[0];
+                    String fileId = entry[1];
+                    File file = new File(entry[2]);
+                    if (!file.isFile()) continue;
+                    JSONObject info = meta.get(roleId + "/" + fileId);
+                    String name = info != null ? info.optString("name", nameWithoutExtension(fileId)) : nameWithoutExtension(fileId);
+                    String mime = info != null && !info.optString("mime", "").isEmpty() ? info.optString("mime") : mimeFromName(fileId);
+                    long createdAt = info != null ? info.optLong("createdAt", file.lastModified()) : file.lastModified();
+                    ContentValues values = new ContentValues();
+                    values.put("id", fileId);
+                    values.put("role_id", Long.parseLong(roleId));
+                    values.put("name", name);
+                    values.put("mime", mime);
+                    values.put("size", file.length());
+                    values.put("created_at", createdAt);
+                    values.put("path", file.getAbsolutePath());
+                    db.insertWithOnConflict("media", null, values, SQLiteDatabase.CONFLICT_REPLACE);
+                    restored += 1;
+                }
+                db.setTransactionSuccessful();
+            } finally {
+                db.endTransaction();
+            }
+            return restored;
         }
     }
 }

@@ -1,17 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  AlertCircle, Archive, BrainCircuit, Check, Download, FileArchive, ImagePlus, RotateCcw, Trash2, Upload, X,
+  AlertCircle, Archive, BrainCircuit, Check, Download, FileArchive, HardDriveDownload, ImagePlus, Package, RotateCcw, Trash2, Upload, X,
 } from 'lucide-react'
 import { AvatarCropper } from './AvatarCropper'
 import { ConfirmDialog } from './ConfirmDialog'
 import {
-  clearMemoriesByRole, exportConversationArchive, exportMemoryArchive, formatBytes,
-  getConversationCounts, getMemoryStats, importConversationArchive, importMemoryArchive,
-  inspectConversationArchive, inspectMemoryArchive, trimConversation,
+  clearMemoriesByRole, exportConversationArchive, exportFullBackup, exportMemoryArchive, formatBytes,
+  getConversationCounts, getMemoryStats, hasNativeMediaLibrary, importConversationArchive, importFullBackup,
+  importMemoryArchive, inspectConversationArchive, inspectMemoryArchive, trimConversation,
   type ImportProgress, type MemoryStats,
 } from './data-library'
 import { useNativeBackDismiss } from './native-back'
 import { OverlayPortal } from './OverlayPortal'
+import type { Role } from './chat-types'
 import type { AppPreferences } from './preferences'
 import { UserAvatar } from './UserAvatar'
 import { runViewTransition } from './view-transitions'
@@ -24,11 +25,13 @@ type SelectionDialog =
 
 const EMPTY_MEMORY_STATS: MemoryStats = { total: 0, archived: 0, byRole: {} }
 
-export function DataSettings({ roles, preferences, onPreferencesChange, onChanged }: {
+export function DataSettings({ roles, preferences, onPreferencesChange, onChanged, onRolesImported }: {
   roles: DataRole[]
   preferences: AppPreferences
   onPreferencesChange: (preferences: AppPreferences) => void
   onChanged: () => Promise<void>
+  // 导入对话时恢复归档中的角色（旧归档按 orphanRoleIds 建占位角色），返回实际新增的角色数量。
+  onRolesImported: (roles: Role[], orphanRoleIds?: number[]) => Promise<number>
 }) {
   const [counts, setCounts] = useState<Record<number, number>>({})
   const [memoryStats, setMemoryStats] = useState<MemoryStats>(EMPTY_MEMORY_STATS)
@@ -40,6 +43,9 @@ export function DataSettings({ roles, preferences, onPreferencesChange, onChange
   const [deleteRole, setDeleteRole] = useState<DataRole | null>(null)
   const [memoryDeleteRole, setMemoryDeleteRole] = useState<DataRole | null>(null)
   const [keepRounds, setKeepRounds] = useState(0)
+  const [backupOpen, setBackupOpen] = useState(false)
+  const [backupIds, setBackupIds] = useState<number[]>([])
+  const nativeBackup = hasNativeMediaLibrary()
   const [cropFile, setCropFile] = useState<File | null>(null)
   const archiveInput = useRef<HTMLInputElement>(null)
   const memoryArchiveInput = useRef<HTMLInputElement>(null)
@@ -51,6 +57,7 @@ export function DataSettings({ roles, preferences, onPreferencesChange, onChange
     setMemoryStats(nextMemoryStats)
   }, [])
   useNativeBackDismiss(Boolean(selection), () => setSelection(null))
+  useNativeBackDismiss(backupOpen, () => setBackupOpen(false))
 
   useEffect(() => { void refresh() }, [refresh])
   useEffect(() => () => { if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current) }, [])
@@ -112,16 +119,73 @@ export function DataSettings({ roles, preferences, onPreferencesChange, onChange
         showNotice('success', `已导出 ${selectedIds.length} 个角色的${current.kind === 'conversation' ? '对话记录' : '长期记忆'}`)
       } else {
         setProgress({ processed: 0, total: 0, bytes: 0 })
-        const imported = current.kind === 'conversation'
-          ? await importConversationArchive(current.file, setProgress, selectedIds)
-          : await importMemoryArchive(current.file, setProgress, selectedIds)
-        await refresh()
-        if (current.kind === 'conversation') await onChanged()
-        showNotice('success', `已导入 ${imported.toLocaleString()} 条${current.kind === 'conversation' ? '对话记录' : '长期记忆'}`)
+        if (current.kind === 'conversation') {
+          const { processed, roles: importedRoles, orphanRoleIds } = await importConversationArchive(current.file, setProgress, selectedIds)
+          const restored = await onRolesImported(importedRoles, orphanRoleIds)
+          await refresh()
+          await onChanged()
+          showNotice('success', restored > 0
+            ? `已导入 ${processed.toLocaleString()} 条对话记录，恢复 ${restored} 个角色`
+            : `已导入 ${processed.toLocaleString()} 条对话记录`)
+        } else {
+          const imported = await importMemoryArchive(current.file, setProgress, selectedIds)
+          await refresh()
+          showNotice('success', `已导入 ${imported.toLocaleString()} 条长期记忆`)
+        }
       }
     } catch (error) {
       const fallback = current.mode === 'export' ? '导出失败' : '导入失败'
       showNotice('error', error instanceof Error ? error.message : fallback)
+    } finally {
+      setBusy(false)
+      setProgress(null)
+    }
+  }
+
+  const beginBackup = () => {
+    // 完整备份的可选角色 = 现有角色 ∪ 有对话/记忆的角色 id。默认全选。
+    const ids = Array.from(new Set([
+      ...roles.map(role => role.id),
+      ...Object.keys(counts).map(Number),
+      ...Object.keys(memoryStats.byRole).map(Number),
+    ]))
+    if (!ids.length) {
+      showNotice('error', '暂无可备份的数据')
+      return
+    }
+    runViewTransition(() => {
+      setBackupIds(ids)
+      setBackupOpen(true)
+    })
+  }
+
+  const confirmBackup = async () => {
+    if (!backupIds.length) return
+    const allSelected = backupIds.length === backupCandidates.length
+    runViewTransition(() => setBackupOpen(false))
+    setBusy(true)
+    try {
+      const result = await exportFullBackup(allSelected ? undefined : backupIds)
+      if (result.saved) showNotice('success', `已备份 ${allSelected ? '全部' : backupIds.length + ' 个'}角色，含 ${result.emojis.toLocaleString()} 张表情`)
+    } catch (error) {
+      showNotice('error', error instanceof Error ? error.message : '备份失败')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const restoreBackup = async () => {
+    setBusy(true)
+    setProgress({ processed: 0, total: 0, bytes: 0 })
+    try {
+      const result = await importFullBackup(setProgress)
+      if (!result) return // 用户取消
+      await onRolesImported(result.roles, result.orphanRoleIds)
+      await refresh()
+      await onChanged()
+      showNotice('success', `已恢复 ${result.processed.toLocaleString()} 条对话、${result.memoriesImported.toLocaleString()} 条记忆、${result.emojis.toLocaleString()} 张表情`)
+    } catch (error) {
+      showNotice('error', error instanceof Error ? error.message : '恢复失败')
     } finally {
       setBusy(false)
       setProgress(null)
@@ -177,8 +241,26 @@ export function DataSettings({ roles, preferences, onPreferencesChange, onChange
       .map(id => ({ id, name: roleName(id), avatar: '' })),
   ]
   const selectionUnit = selection?.kind === 'conversation' ? '条消息' : '条记忆'
+  // 完整备份可选角色：现有角色 + 仅存在于对话/记忆里的角色（占位名）。
+  const backupCandidates = [
+    ...roles,
+    ...Array.from(new Set([...Object.keys(counts).map(Number), ...Object.keys(memoryStats.byRole).map(Number)]))
+      .filter(id => !roles.some(role => role.id === id))
+      .map(id => ({ id, name: roleName(id), avatar: '' })),
+  ]
 
   return <div className="data-settings">
+    {nativeBackup && <section className="setting-group backup-settings">
+      <div className="data-heading">
+        <div><h2>完整备份</h2><p>把对话、角色与提示词、长期记忆、表情包打包成一个文件，换设备一键迁移。</p></div>
+        <div>
+          <button className="secondary" onClick={beginBackup} disabled={busy}><Package />导出备份</button>
+          <button className="primary" onClick={() => void restoreBackup()} disabled={busy}><HardDriveDownload />恢复备份</button>
+        </div>
+      </div>
+      <div className="data-summary"><Package /><div><strong>一个文件包含全部数据</strong><span>恢复时会新增缺失的角色，不覆盖已有角色的编辑</span></div><b>.zip</b></div>
+    </section>}
+
     <section className="setting-group profile-settings">
       <div className="data-heading"><div><h2>个人资料</h2><p>用于聊天中的用户头像和名称，仅保存在本机。</p></div></div>
       <div className="profile-settings-body">
@@ -200,7 +282,7 @@ export function DataSettings({ roles, preferences, onPreferencesChange, onChange
         <div>
           <button className="secondary" onClick={() => beginExport('conversation')} disabled={busy || !total}><Upload />导出</button>
           <button className="primary" onClick={() => archiveInput.current?.click()} disabled={busy}><Download />导入</button>
-          <input ref={archiveInput} hidden type="file" accept=".ndjson,application/x-ndjson" onChange={event => void inspectImport('conversation', event.target.files?.[0])} />
+          <input ref={archiveInput} hidden type="file" accept="*/*" onChange={event => void inspectImport('conversation', event.target.files?.[0])} />
         </div>
       </div>
       <div className="data-summary"><FileArchive /><div><strong>{total.toLocaleString()} 条本地消息</strong><span>归档文件可以按角色选择导入或导出</span></div><b>{progress?.bytes ? formatBytes(progress.bytes) : '本机'}</b></div>
@@ -221,7 +303,7 @@ export function DataSettings({ roles, preferences, onPreferencesChange, onChange
         <div>
           <button className="secondary" onClick={() => beginExport('memory')} disabled={busy || !memoryStats.total}><Upload />导出</button>
           <button className="primary" onClick={() => memoryArchiveInput.current?.click()} disabled={busy}><Download />导入</button>
-          <input ref={memoryArchiveInput} hidden type="file" accept=".ndjson,application/x-ndjson" onChange={event => void inspectImport('memory', event.target.files?.[0])} />
+          <input ref={memoryArchiveInput} hidden type="file" accept="*/*" onChange={event => void inspectImport('memory', event.target.files?.[0])} />
         </div>
       </div>
       <div className="memory-data-metrics">
@@ -261,6 +343,25 @@ export function DataSettings({ roles, preferences, onPreferencesChange, onChange
           })}
         </div>
         <footer><button className="secondary" onClick={() => runViewTransition(() => setSelection(null))}>取消</button><button className="primary" disabled={!selectedIds.length} onClick={() => void confirmSelection()}>{selection.mode === 'export' ? <Upload /> : <Download />}{selection.mode === 'export' ? '导出所选' : '导入所选'}</button></footer>
+      </section>
+    </div></OverlayPortal>}
+
+    {backupOpen && <OverlayPortal><div className="dialog-overlay" role="dialog" aria-modal="true" aria-labelledby="backup-selection-title">
+      <section className="data-selection-dialog">
+        <header><div><h2 id="backup-selection-title">选择备份角色</h2><p>勾选要打包的角色，将一并备份其对话、提示词、长期记忆和表情包</p></div><button className="icon-btn" onClick={() => runViewTransition(() => setBackupOpen(false))} aria-label="关闭"><X /></button></header>
+        <div className="data-selection-actions">
+          <button onClick={() => setBackupIds(backupCandidates.map(role => role.id))}>全选</button>
+          <button onClick={() => setBackupIds([])}>清空</button>
+        </div>
+        <div className="data-selection-list">
+          {backupCandidates.map(role => {
+            const checked = backupIds.includes(role.id)
+            const messageCount = counts[role.id] ?? 0
+            const memoryCount = memoryStats.byRole[role.id]?.total ?? 0
+            return <label key={role.id} className={checked ? 'selected' : ''}><input type="checkbox" checked={checked} onChange={() => setBackupIds(current => checked ? current.filter(item => item !== role.id) : [...current, role.id])} /><span><strong>{role.name}</strong><small>{messageCount.toLocaleString()} 条消息 · {memoryCount.toLocaleString()} 条记忆</small></span><i>{checked && <Check />}</i></label>
+          })}
+        </div>
+        <footer><button className="secondary" onClick={() => runViewTransition(() => setBackupOpen(false))}>取消</button><button className="primary" disabled={!backupIds.length} onClick={() => void confirmBackup()}><Package />导出备份</button></footer>
       </section>
     </div></OverlayPortal>}
 
