@@ -1,7 +1,7 @@
 import { CapacitorHttp, type HttpResponse } from '@capacitor/core'
 import { buildChatSystemPrompt, formatConversationTime } from './chat-protocol'
 import { completeDebugRequest, recordDebugRequest } from './debug-log'
-import { getAttachmentImageDataUrl } from './device-features'
+import { getAttachmentImageDataUrl, loadNativeSecret, saveNativeSecret } from './device-features'
 import type { ChatAttachment } from './chat-types'
 import type { StoredMemory } from './data-library'
 
@@ -57,6 +57,8 @@ export type AiMessage = {
 }
 
 const STORAGE_KEY = 'mchat2-model-config'
+const API_KEY_SECRET = 'chat-api-key'
+let secureApiKey: string | null = null
 
 // 保存模型配置后广播，供常驻挂载的界面（如 ChatView）实时刷新，避免使用过期配置。
 export const MODEL_CONFIG_CHANGED_EVENT = 'mchat2:model-config-changed'
@@ -79,7 +81,7 @@ export function loadModelConfig(): ModelConfig {
     const storedDelay = Number(stored.queueDelaySeconds)
     return {
       baseUrl: String(stored.baseUrl ?? defaultModelConfig.baseUrl),
-      apiKey: String(stored.apiKey ?? ''),
+      apiKey: secureApiKey ?? String(stored.apiKey ?? ''),
       model: stored.model === 'gpt-4.1-mini' ? '' : String(stored.model ?? ''),
       models: Array.isArray(stored.models) ? stored.models.filter((item): item is string => typeof item === 'string') : [],
       temperature: Number(stored.temperature ?? defaultModelConfig.temperature),
@@ -96,9 +98,40 @@ export function loadModelConfig(): ModelConfig {
   }
 }
 
-export function saveModelConfig(config: ModelConfig) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(config))
+export async function saveModelConfig(config: ModelConfig) {
+  const next = { ...config }
+  try {
+    if (secureApiKey !== config.apiKey) {
+      const storedNatively = await saveNativeSecret(API_KEY_SECRET, config.apiKey)
+      if (storedNatively) secureApiKey = config.apiKey
+    }
+    if (secureApiKey !== null) next.apiKey = ''
+  } finally {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(next))
+  }
   if (typeof window !== 'undefined') window.dispatchEvent(new Event(MODEL_CONFIG_CHANGED_EVENT))
+}
+
+export async function initializeModelSecret() {
+  let stored: Partial<ModelConfig> = {}
+  try {
+    stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as Partial<ModelConfig>
+  } catch {
+    // Keep the default configuration when the legacy record is malformed.
+  }
+  try {
+    const nativeValue = await loadNativeSecret(API_KEY_SECRET)
+    if (nativeValue === null) return
+    const legacyValue = typeof stored.apiKey === 'string' ? stored.apiKey : ''
+    secureApiKey = nativeValue || legacyValue
+    if (!nativeValue && legacyValue) await saveNativeSecret(API_KEY_SECRET, legacyValue)
+    if ('apiKey' in stored) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...stored, apiKey: '' }))
+    }
+    window.dispatchEvent(new Event(MODEL_CONFIG_CHANGED_EVENT))
+  } catch {
+    secureApiKey = typeof stored.apiKey === 'string' ? stored.apiKey : ''
+  }
 }
 
 function chatEndpoint(baseUrl: string) {
@@ -307,4 +340,3 @@ export async function testModelConnection(config: ModelConfig) {
     persona: '请只回复“连接正常”。',
   }, [{ from: 'me', text: '请测试当前模型连接。' }])
 }
-

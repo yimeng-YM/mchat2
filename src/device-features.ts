@@ -1,5 +1,6 @@
-import { Capacitor, registerPlugin } from '@capacitor/core'
+import { Capacitor, registerPlugin, type PluginListenerHandle } from '@capacitor/core'
 import type { ChatAttachment } from './chat-types'
+import { uiAssetDataUrl } from './asset-storage'
 
 type NativeAttachment = Omit<ChatAttachment, 'uri' | 'rawUri'> & { uri: string }
 
@@ -8,8 +9,15 @@ interface DeviceFeaturesPlugin {
   readImageDataUrl(options: { uri: string; maxDimension: number; quality: number }): Promise<{ dataUrl: string }>
   startSpeech(): Promise<{ text: string } | { cancelled: true }>
   requestNotifications(): Promise<{ granted: boolean }>
+  checkNotifications(): Promise<{ granted: boolean }>
+  openAppSettings(): Promise<void>
   notify(options: { roleId: number; title: string; body: string; avatarDataUrl?: string }): Promise<void>
   clearNotifications(options: { roleId?: number }): Promise<void>
+  getPendingNotificationOpen(): Promise<{ roleId?: number }>
+  addListener(eventName: 'notificationOpened', listener: (event: { roleId: number }) => void): Promise<PluginListenerHandle>
+  saveSecret(options: { key: string; value: string }): Promise<void>
+  loadSecret(options: { key: string }): Promise<{ value?: string }>
+  clearSecret(options: { key: string }): Promise<void>
   removeRoleFiles(options: { roleId: number }): Promise<void>
 }
 
@@ -66,6 +74,9 @@ export async function getAttachmentImageDataUrl(attachment: ChatAttachment) {
 
 async function notificationAvatarDataUrl(source: string) {
   try {
+    if (source.startsWith('mchat2-asset:')) {
+      return await uiAssetDataUrl(source)
+    }
     if (source.startsWith('data:image/') && !source.startsWith('data:image/svg')) return source
     const blob = await fetch(source).then(response => response.blob())
     return await imageBlobDataUrl(blob, 192, 0.88)
@@ -124,6 +135,15 @@ export async function requestNotificationPermission() {
   return (await deviceFeatures.requestNotifications()).granted
 }
 
+export async function checkNotificationPermission() {
+  if (!hasNativeDeviceFeatures()) return true
+  return (await deviceFeatures.checkNotifications()).granted
+}
+
+export async function openNativeAppSettings() {
+  if (hasNativeDeviceFeatures()) await deviceFeatures.openAppSettings()
+}
+
 export async function showReplyNotification(roleId: number, title: string, body: string, avatar?: string) {
   if (!hasNativeDeviceFeatures()) return
   await deviceFeatures.notify({ roleId, title, body, avatarDataUrl: avatar ? await notificationAvatarDataUrl(avatar) : undefined })
@@ -133,6 +153,31 @@ export async function showReplyNotification(roleId: number, title: string, body:
 export async function clearRoleNotification(roleId?: number) {
   if (!hasNativeDeviceFeatures()) return
   await deviceFeatures.clearNotifications(roleId === undefined ? {} : { roleId })
+}
+
+export async function consumePendingNotificationOpen() {
+  if (!hasNativeDeviceFeatures()) return null
+  const result = await deviceFeatures.getPendingNotificationOpen()
+  return Number.isFinite(result.roleId) && Number(result.roleId) > 0 ? Number(result.roleId) : null
+}
+
+export async function onNotificationOpened(handler: (roleId: number) => void) {
+  if (!hasNativeDeviceFeatures()) return null
+  return deviceFeatures.addListener('notificationOpened', event => {
+    if (Number.isFinite(event.roleId) && event.roleId > 0) handler(event.roleId)
+  })
+}
+
+export async function saveNativeSecret(key: string, value: string) {
+  if (!hasNativeDeviceFeatures()) return false
+  if (value) await deviceFeatures.saveSecret({ key, value })
+  else await deviceFeatures.clearSecret({ key })
+  return true
+}
+
+export async function loadNativeSecret(key: string) {
+  if (!hasNativeDeviceFeatures()) return null
+  return (await deviceFeatures.loadSecret({ key })).value ?? ''
 }
 
 export async function removeNativeRoleFiles(roleId: number) {

@@ -29,18 +29,18 @@ export function ModelSettings() {
     setMemoryStatus('')
   }
 
-  const saveMemoryModel = () => {
-    saveMemoryModelConfig(memoryConfig)
+  const saveMemoryModel = async () => {
+    await saveMemoryModelConfig(memoryConfig)
     setMemoryStatus('记忆模型设置已保存')
   }
 
-  const save = () => {
-    saveModelConfig(config)
+  const save = async () => {
+    await saveModelConfig(config)
     setStatus('设置已保存')
   }
 
   const test = async () => {
-    saveModelConfig(config)
+    await saveModelConfig(config)
     setTesting(true)
     setStatus('')
     try {
@@ -60,7 +60,7 @@ export function ModelSettings() {
       const models = await fetchModelList(config)
       const next = { ...config, models }
       setConfig(next)
-      saveModelConfig(next)
+      await saveModelConfig(next)
       setStatus(`已获取并保存 ${models.length} 个模型`)
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '获取模型列表失败')
@@ -87,7 +87,7 @@ export function ModelSettings() {
       <div className="model-actions">
         <span className={status.startsWith('连接成功') || status.startsWith('已获取') || status === '设置已保存' ? 'success' : ''}>{status && <CheckCircle2 />}{status}</span>
         <button className="secondary" onClick={() => void test()} disabled={testing}>{testing ? <LoaderCircle className="spin" /> : <PlugZap />}测试连接</button>
-        <button className="primary" onClick={save}><Save />保存设置</button>
+        <button className="primary" onClick={() => void save()}><Save />保存设置</button>
       </div>
     </section>
 
@@ -138,7 +138,7 @@ export function ModelSettings() {
         </div></label>
         <div className="memory-model-actions">
           <span className={memoryStatus ? 'success' : ''}>{memoryStatus && <CheckCircle2 />}{memoryStatus}</span>
-          <button className="secondary" onClick={saveMemoryModel}><Save />保存记忆模型</button>
+          <button className="secondary" onClick={() => void saveMemoryModel()}><Save />保存记忆模型</button>
         </div>
       </div>}
     </section>

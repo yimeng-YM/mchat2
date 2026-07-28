@@ -31,6 +31,7 @@ export type ChatAttachment = {
 
 export type Message = {
   id: number
+  createdAt?: number
   from: 'me' | 'them'
   text: string
   kind?: 'text' | 'emoji' | 'attachment'

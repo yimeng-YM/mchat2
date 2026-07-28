@@ -16,6 +16,7 @@ export type AppPreferences = {
   topBarOpacity: number
   navigationOpacity: number
   inputOpacity: number
+  reduceMotion: boolean
   typingStatus: boolean
   messageSound: boolean
   notificationsEnabled: boolean
@@ -39,6 +40,7 @@ export const defaultAppPreferences: AppPreferences = {
   topBarOpacity: 54,
   navigationOpacity: 64,
   inputOpacity: 68,
+  reduceMotion: false,
   typingStatus: true,
   messageSound: false,
   notificationsEnabled: false,
@@ -71,6 +73,7 @@ export function loadAppPreferences(): AppPreferences {
       topBarOpacity: validSurfaceOpacity(stored.topBarOpacity, defaultAppPreferences.topBarOpacity),
       navigationOpacity: validSurfaceOpacity(stored.navigationOpacity, defaultAppPreferences.navigationOpacity),
       inputOpacity: validSurfaceOpacity(stored.inputOpacity, defaultAppPreferences.inputOpacity),
+      reduceMotion: stored.reduceMotion === true,
       typingStatus: stored.typingStatus ?? defaultAppPreferences.typingStatus,
       messageSound: stored.messageSound ?? defaultAppPreferences.messageSound,
       notificationsEnabled: stored.notificationsEnabled ?? defaultAppPreferences.notificationsEnabled,
@@ -93,6 +96,8 @@ export function saveAppPreferences(preferences: AppPreferences) {
 }
 
 const MEMORY_MODEL_KEY = 'mchat2-memory-model-config'
+const MEMORY_API_KEY_SECRET = 'memory-api-key'
+let secureMemoryApiKey: string | null = null
 
 export const defaultMemoryModelConfig: MemoryModelConfig = {
   baseUrl: '',
@@ -106,7 +111,7 @@ export function loadMemoryModelConfig(): MemoryModelConfig {
     const stored = JSON.parse(localStorage.getItem(MEMORY_MODEL_KEY) ?? '{}') as Partial<MemoryModelConfig>
     return {
       baseUrl: String(stored.baseUrl ?? ''),
-      apiKey: String(stored.apiKey ?? ''),
+      apiKey: secureMemoryApiKey ?? String(stored.apiKey ?? ''),
       model: String(stored.model ?? ''),
       temperature: Number.isFinite(stored.temperature) ? Math.min(2, Math.max(0, stored.temperature as number)) : defaultMemoryModelConfig.temperature,
     }
@@ -115,8 +120,38 @@ export function loadMemoryModelConfig(): MemoryModelConfig {
   }
 }
 
-export function saveMemoryModelConfig(config: MemoryModelConfig) {
-  localStorage.setItem(MEMORY_MODEL_KEY, JSON.stringify(config))
+export async function saveMemoryModelConfig(config: MemoryModelConfig) {
+  const next = { ...config }
+  try {
+    if (secureMemoryApiKey !== config.apiKey) {
+      const storedNatively = await saveNativeSecret(MEMORY_API_KEY_SECRET, config.apiKey)
+      if (storedNatively) secureMemoryApiKey = config.apiKey
+    }
+    if (secureMemoryApiKey !== null) next.apiKey = ''
+  } finally {
+    localStorage.setItem(MEMORY_MODEL_KEY, JSON.stringify(next))
+  }
+}
+
+export async function initializeMemoryModelSecret() {
+  let stored: Partial<MemoryModelConfig> = {}
+  try {
+    stored = JSON.parse(localStorage.getItem(MEMORY_MODEL_KEY) ?? '{}') as Partial<MemoryModelConfig>
+  } catch {
+    // Ignore a malformed legacy value and keep defaults.
+  }
+  try {
+    const nativeValue = await loadNativeSecret(MEMORY_API_KEY_SECRET)
+    if (nativeValue === null) return
+    const legacyValue = typeof stored.apiKey === 'string' ? stored.apiKey : ''
+    secureMemoryApiKey = nativeValue || legacyValue
+    if (!nativeValue && legacyValue) await saveNativeSecret(MEMORY_API_KEY_SECRET, legacyValue)
+    if ('apiKey' in stored) {
+      localStorage.setItem(MEMORY_MODEL_KEY, JSON.stringify({ ...stored, apiKey: '' }))
+    }
+  } catch {
+    secureMemoryApiKey = typeof stored.apiKey === 'string' ? stored.apiKey : ''
+  }
 }
 
 let audioContext: AudioContext | null = null
@@ -139,3 +174,4 @@ export function playMessageTone(type: 'sent' | 'received') {
     // Some WebViews disable audio until the first user gesture.
   }
 }
+import { loadNativeSecret, saveNativeSecret } from './device-features'

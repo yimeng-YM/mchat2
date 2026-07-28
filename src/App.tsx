@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { App as CapacitorApp } from '@capacitor/app'
 import type { PluginListenerHandle } from '@capacitor/core'
 import {
@@ -10,17 +10,23 @@ import { ChatView } from './ChatView'
 import { ColorPicker } from './ColorPicker'
 import { DataSettings } from './DataSettings'
 import { DebugOverlay } from './DebugOverlay'
-import { clearRoleNotification, requestNotificationPermission } from './device-features'
+import {
+  checkNotificationPermission,
+  clearRoleNotification,
+  consumePendingNotificationOpen,
+  onNotificationOpened,
+  openNativeAppSettings,
+  requestNotificationPermission,
+} from './device-features'
 import { useKeyboardInset } from './keyboard-inset'
 import { ModelSettings } from './ModelSettings'
 import { QueueSettings } from './QueueSettings'
 import { RoleEditorPanel, type EditableRole } from './RoleEditorPanel'
 import {
   loadConversation, normalizeArchivedRole, removeLegacyDefaultData, removeRoleData, replaceConversationGroup,
-  saveConversationMessages, updateConversationMessages,
 } from './data-library'
 import {
-  defaultAppPreferences, loadAppPreferences, MAX_MEMORY_EXTRACTION_INTERVAL, saveAppPreferences, type AppPreferences,
+  defaultAppPreferences, initializeMemoryModelSecret, loadAppPreferences, MAX_MEMORY_EXTRACTION_INTERVAL, saveAppPreferences, type AppPreferences,
 } from './preferences'
 import type { Message, Role } from './chat-types'
 import { resetConversationRoundCount } from './memory-service'
@@ -29,9 +35,23 @@ import { onConversationIncoming } from './conversation-events'
 import { rangeProgressStyle } from './range-style'
 import { runViewTransition } from './view-transitions'
 import { UserAvatar } from './UserAvatar'
+import { initializeModelSecret } from './ai-service'
+import { loadConversationPreviews, searchConversationMessages } from './conversation-repository'
+import {
+  bootstrapConversationRuntimes,
+  clearConversationRuntime,
+  configureConversationRuntime,
+  refreshConversationRuntimes,
+} from './conversation-runtime'
+import { migrateRoleUiAssets, persistUiAsset } from './asset-storage'
+import { StoredImage } from './StoredImage'
 
 type Page = 'chat' | 'settings'
 type FluidPillDirection = 'forward' | 'backward'
+
+const DEFAULT_OUTLINE_HIGHLIGHT_ANGLE = 0
+const HANDHELD_PORTRAIT_BETA = 55
+const OUTLINE_FRAME_INTERVAL = 1000 / 30
 
 function useFluidPill(activeKey: string, activeIndex: number) {
   const navRef = useRef<HTMLElement | null>(null)
@@ -105,52 +125,86 @@ function useOutlineHighlight(enabled: boolean) {
 
   useEffect(() => {
     const root = rootRef.current
-    if (!root || !enabled) return
+    if (!root || !enabled || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return
 
-    let currentAngle = 315
+    let currentAngle = DEFAULT_OUTLINE_HIGHLIGHT_ANGLE
     let targetAngle = currentAngle
+    let paintedAngle = currentAngle
     let animationFrame = 0
+    let lastFrameTime = 0
     let sensorPausedUntil = 0
     const finePointer = window.matchMedia('(pointer:fine)').matches
+    const angleDelta = (to: number, from: number) => ((to - from + 540) % 360) - 180
 
-    const animate = () => {
-      const delta = ((targetAngle - currentAngle + 540) % 360) - 180
-      currentAngle = (currentAngle + delta * 0.16 + 360) % 360
-      root.style.setProperty('--outline-highlight-angle', `${currentAngle.toFixed(2)}deg`)
-      if (Math.abs(delta) > 0.12) animationFrame = window.requestAnimationFrame(animate)
-      else animationFrame = 0
+    const paint = (angle: number) => {
+      const quantized = Math.round(angle * 2) / 2
+      if (Math.abs(angleDelta(quantized, paintedAngle)) < 0.45) return
+      paintedAngle = quantized
+      root.style.setProperty('--outline-highlight-angle', `${quantized.toFixed(1)}deg`)
     }
-    const aimHighlight = (angle: number) => {
-      targetAngle = (angle + 360) % 360
+    const animate = (time: number) => {
+      if (document.hidden) {
+        animationFrame = 0
+        lastFrameTime = 0
+        return
+      }
+      if (lastFrameTime && time - lastFrameTime < OUTLINE_FRAME_INTERVAL) {
+        animationFrame = window.requestAnimationFrame(animate)
+        return
+      }
+
+      const elapsed = lastFrameTime ? Math.min(time - lastFrameTime, 64) : OUTLINE_FRAME_INTERVAL
+      lastFrameTime = time
+      const delta = angleDelta(targetAngle, currentAngle)
+      const smoothing = 1 - Math.pow(0.84, elapsed / (1000 / 60))
+      currentAngle = (currentAngle + delta * smoothing + 360) % 360
+      paint(currentAngle)
+
+      if (Math.abs(delta) > 0.35) {
+        animationFrame = window.requestAnimationFrame(animate)
+      } else {
+        currentAngle = targetAngle
+        paint(currentAngle)
+        animationFrame = 0
+        lastFrameTime = 0
+      }
+    }
+    const aimHighlight = (angle: number, deadZone: number) => {
+      const nextAngle = (angle + 360) % 360
+      if (Math.abs(angleDelta(nextAngle, targetAngle)) < deadZone) return
+      targetAngle = nextAngle
       if (!animationFrame) animationFrame = window.requestAnimationFrame(animate)
     }
     const followOrientation = (event: DeviceOrientationEvent) => {
       if (performance.now() < sensorPausedUntil) return
       if (event.beta === null || event.gamma === null) return
-      const beta = event.beta * Math.PI / 180
-      const gamma = Math.max(-90, Math.min(90, event.gamma)) * Math.PI / 180
 
-      // Project the device's higher edge into its screen plane. Positive beta
-      // raises the top edge; positive gamma lowers the right edge.
-      const naturalX = -Math.cos(beta) * Math.sin(gamma)
-      const naturalY = -Math.sin(beta)
-      if (Math.hypot(naturalX, naturalY) < 0.035) return
+      // A phone held at roughly 55° in portrait is the neutral pose. This keeps
+      // the highlight responsive around a normal one-handed grip instead of
+      // treating a phone lying flat on a table as the center point.
+      const pitchDelta = Math.max(-70, Math.min(70, event.beta - HANDHELD_PORTRAIT_BETA)) * Math.PI / 180
+      const roll = Math.max(-60, Math.min(60, event.gamma)) * Math.PI / 180
+      const restingDirection = (DEFAULT_OUTLINE_HIGHLIGHT_ANGLE - 90) * Math.PI / 180
+      const restingStrength = 0.32
+      const naturalX = Math.cos(restingDirection) * restingStrength - Math.sin(roll) * Math.cos(pitchDelta) * 1.15
+      const naturalY = Math.sin(restingDirection) * restingStrength - Math.sin(pitchDelta) * 0.9
 
       const screenRotation = (window.screen.orientation?.angle ?? 0) * Math.PI / 180
       const screenX = naturalX * Math.cos(screenRotation) + naturalY * Math.sin(screenRotation)
       const screenY = -naturalX * Math.sin(screenRotation) + naturalY * Math.cos(screenRotation)
-      aimHighlight(Math.atan2(screenY, screenX) * 180 / Math.PI + 90)
+      aimHighlight(Math.atan2(screenY, screenX) * 180 / Math.PI + 90, 1.25)
     }
     const followPointer = (event: PointerEvent) => {
       if (!finePointer) return
       const bounds = root.getBoundingClientRect()
       const x = event.clientX - bounds.left - bounds.width / 2
       const y = event.clientY - bounds.top - bounds.height / 2
-      aimHighlight(Math.atan2(y, x) * 180 / Math.PI + 90)
+      aimHighlight(Math.atan2(y, x) * 180 / Math.PI + 90, 0.4)
     }
     const pauseSensorHighlight = () => {
       sensorPausedUntil = performance.now() + 160
       targetAngle = currentAngle
+      lastFrameTime = 0
       if (animationFrame) {
         window.cancelAnimationFrame(animationFrame)
         animationFrame = 0
@@ -165,6 +219,7 @@ function useOutlineHighlight(enabled: boolean) {
       window.removeEventListener('pointermove', followPointer)
       root.removeEventListener('scroll', pauseSensorHighlight, { capture: true })
       if (animationFrame) window.cancelAnimationFrame(animationFrame)
+      root.style.removeProperty('--outline-highlight-angle')
     }
   }, [enabled])
 
@@ -258,13 +313,37 @@ function ConversationList({ roles, messages, selected, onSelect, onCreate, mobil
   mobileOpen: boolean
 }) {
   const [query, setQuery] = useState('')
+  const deferredQuery = useDeferredValue(query)
+  const [searchMatches, setSearchMatches] = useState<Map<number, Message>>(new Map())
+  const roleIdsKey = roles.map(role => role.id).join(',')
+  const searchableRoleIds = useMemo(
+    () => roleIdsKey ? roleIdsKey.split(',').map(Number) : [],
+    [roleIdsKey],
+  )
+  useEffect(() => {
+    let cancelled = false
+    if (!deferredQuery.trim()) {
+      setSearchMatches(new Map())
+      return
+    }
+    void searchConversationMessages(deferredQuery, searchableRoleIds).then(matches => {
+      if (!cancelled) setSearchMatches(matches)
+    })
+    return () => { cancelled = true }
+  }, [deferredQuery, searchableRoleIds])
   // 会话按最近活跃排序：最后一条消息越新越靠上，收到新消息的角色自然置顶；
   // 尚无消息的角色用其 id（创建时间）作为排序键。消息 id 由 Date.now() 生成，可跨角色比较。
-  const recency = (role: Role) => lastMessage(messages[role.id])?.id ?? role.id
+  const recency = (role: Role) => {
+    const latest = lastMessage(messages[role.id])
+    return latest?.createdAt ?? latest?.id ?? role.id
+  }
   const filtered = roles
     .filter(role => {
       const last = lastMessage(messages[role.id])
-      return role.name.includes(query) || messagePreview(last).includes(query)
+      const normalized = query.toLocaleLowerCase()
+      return role.name.toLocaleLowerCase().includes(normalized)
+        || messagePreview(last).toLocaleLowerCase().includes(normalized)
+        || searchMatches.has(role.id)
     })
     .sort((a, b) => recency(b) - recency(a))
 
@@ -273,7 +352,7 @@ function ConversationList({ roles, messages, selected, onSelect, onCreate, mobil
     <label className="search"><Search /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索联系人或消息" />{query && <button onClick={() => setQuery('')} aria-label="清空搜索"><X /></button>}</label>
     <div className="conversation-list">
       {filtered.map(role => {
-        const last = lastMessage(messages[role.id])
+        const last = query.trim() ? searchMatches.get(role.id) ?? lastMessage(messages[role.id]) : lastMessage(messages[role.id])
         return <button key={role.id} className={`conversation ${selected === role.id ? 'selected' : ''}`} onClick={() => onSelect(role.id)}>
           <Avatar role={role} />
           <span className="conversation-copy"><strong>{role.name}</strong><small>{messagePreview(last)}</small></span>
@@ -348,9 +427,14 @@ function SettingsPage({ dark, setDark, roles, preferences, setPreferences, onDat
       patchPreference({ notificationsEnabled: false })
       return
     }
-    const granted = await requestNotificationPermission()
-    if (granted) patchPreference({ notificationsEnabled: true })
-    else setNotificationNotice('系统未授予通知权限，请在 Android 应用设置中允许通知。')
+    try {
+      const granted = await requestNotificationPermission()
+      if (granted) patchPreference({ notificationsEnabled: true })
+      else setNotificationNotice('系统未授予通知权限，请在 Android 应用设置中允许通知。')
+    } catch (error) {
+      patchPreference({ notificationsEnabled: false })
+      setNotificationNotice(error instanceof Error ? error.message : '无法申请通知权限')
+    }
   }
 
   return <main className="page settings-page view-surface">
@@ -401,6 +485,12 @@ function SettingsPage({ dark, setDark, roles, preferences, setPreferences, onDat
           <div className="theme-options">
             <button className={!dark ? 'selected' : ''} onClick={() => setDark(false)}><div className="theme-preview light"><i /><span /><span /></div><strong><Sun />浅色</strong></button>
             <button className={dark ? 'selected' : ''} onClick={() => setDark(true)}><div className="theme-preview dark"><i /><span /><span /></div><strong><Moon />深色</strong></button>
+          </div>
+        </div>
+        <div className="setting-group appearance-motion"><h2>动态效果</h2><p>单独控制界面转场、液态胶囊和姿态高光。</p>
+          <div className="setting-row">
+            <div><strong>减少动态效果</strong><span>关闭界面切换与动态高光；系统启用减少动态效果时也会自动遵循</span></div>
+            <Toggle label="减少动态效果" checked={preferences.reduceMotion} onChange={value => patchPreference({ reduceMotion: value })} />
           </div>
         </div>
         <div className="setting-group appearance-colors">
@@ -475,6 +565,7 @@ function SettingsPage({ dark, setDark, roles, preferences, setPreferences, onDat
               topBarOpacity: defaultAppPreferences.topBarOpacity,
               navigationOpacity: defaultAppPreferences.navigationOpacity,
               inputOpacity: defaultAppPreferences.inputOpacity,
+              reduceMotion: defaultAppPreferences.reduceMotion,
             })
           }}><RotateCcw />恢复默认外观</button>
         </div>
@@ -490,9 +581,9 @@ function SettingsPage({ dark, setDark, roles, preferences, setPreferences, onDat
       {section === 'model' && <section className="settings-content"><ModelSettings /></section>}
       {section === 'notifications' && <section className="settings-content">
         <div className="setting-group"><h2>消息通知</h2>
-          <div className="setting-row"><div><strong>允许本地通知</strong><span>应用在后台时，角色回复后发送系统通知</span></div><Toggle label="允许本地通知" checked={preferences.notificationsEnabled} onChange={v => setPreferences({...preferences, notificationsEnabled: v})} /></div>
-          <div className="setting-row"><div><strong>显示消息内容</strong><span>关闭后通知只显示“收到一条新消息”</span></div><Toggle label="显示消息内容" checked={preferences.notificationPreview} onChange={v => setPreferences({...preferences, notificationPreview: v})} /></div>
-          {notificationNotice && <p className="setting-warning">{notificationNotice}</p>}
+          <div className="setting-row"><div><strong>允许本地通知</strong><span>应用在后台时，角色回复后发送系统通知</span></div><Toggle label="允许本地通知" checked={preferences.notificationsEnabled} onChange={v => void setNotifications(v)} /></div>
+          <div className="setting-row"><div><strong>显示消息内容</strong><span>关闭后通知只显示“收到一条新消息”</span></div><Toggle label="显示消息内容" checked={preferences.notificationPreview} disabled={!preferences.notificationsEnabled} onChange={v => setPreferences({...preferences, notificationPreview: v})} /></div>
+          {notificationNotice && <p className="setting-warning">{notificationNotice}<button className="secondary compact" type="button" onClick={() => void openNativeAppSettings()}>打开系统设置</button></p>}
         </div>
       </section>}
       {section === 'data' && <section className="settings-content"><DataSettings roles={roles} preferences={preferences} onPreferencesChange={setPreferences} onChanged={onDataChanged} onRolesImported={onRolesImported} /></section>}
@@ -526,26 +617,52 @@ export default function App() {
   const [mobileConversations, setMobileConversations] = useState(() => window.matchMedia('(max-width: 820px)').matches)
   const [messages, setAllMessages] = useState<Record<number, Message[]>>({})
   const [preferences, setPreferences] = useState(loadAppPreferences)
-  const outlineHighlightRef = useOutlineHighlight(preferences.interfaceStyle === 'glass')
+  const outlineHighlightRef = useOutlineHighlight(preferences.interfaceStyle === 'glass' && !preferences.reduceMotion)
   const [roles, setRoles] = useState<Role[]>(() => {
     try {
-      const stored = JSON.parse(localStorage.getItem('mchat2-roles') ?? '[]') as Role[]
+      const parsed = JSON.parse(localStorage.getItem('mchat2-roles') ?? '[]') as Role[] | { version?: number; roles?: Role[] }
+      const stored = Array.isArray(parsed) ? parsed : Array.isArray(parsed.roles) ? parsed.roles : []
       return stored.filter(role => ![1, 2, 3, 4].includes(role.id)).map(role => ({ ...role, unread: Number.isFinite(role.unread) ? role.unread : 0 }))
     } catch {
       return []
     }
   })
+  const roleIdsKey = roles.map(role => role.id).join(',')
+  const roleIds = useMemo(() => roleIdsKey ? roleIdsKey.split(',').map(Number) : [], [roleIdsKey])
 
   const selectedRole = useMemo(() => roles.find(role => role.id === selectedId) ?? null, [roles, selectedId])
   const dark = preferences.colorMode === 'dark'
   const setDark = (value: boolean) => setPreferences(current => ({ ...current, colorMode: value ? 'dark' : 'light' }))
   // 当前正在“对应聊天界面”查看的会话 id；不在该界面时为 null，收到回复即计入未读。
   const activeConversationRef = useRef<number | null>(null)
+  const rolesRef = useRef(roles)
+  const preferencesRef = useRef(preferences)
+  useLayoutEffect(() => { rolesRef.current = roles }, [roles])
+  useLayoutEffect(() => { preferencesRef.current = preferences }, [preferences])
+
+  const applyMessageUpdates = (roleId: number, changedMessages: Message[]) => {
+    const changed = new Map(changedMessages.map(message => [message.id, message]))
+    setAllMessages(previous => ({
+      ...previous,
+      [roleId]: (previous[roleId] || []).map(message => changed.get(message.id) ?? message),
+    }))
+  }
 
   useKeyboardInset()
 
   useEffect(() => {
     void removeLegacyDefaultData().catch(() => {})
+    void Promise.all([initializeModelSecret(), initializeMemoryModelSecret()])
+    let disposed = false
+    void migrateRoleUiAssets(rolesRef.current).then(async result => {
+      if (!disposed && result.changed) setRoles(result.roles)
+      const currentAvatar = preferencesRef.current.userAvatar
+      if (currentAvatar.startsWith('data:image/')) {
+        const userAvatar = await persistUiAsset(currentAvatar, 'user:avatar')
+        if (!disposed) setPreferences(current => ({ ...current, userAvatar }))
+      }
+    }).catch(() => {})
+    return () => { disposed = true }
   }, [])
 
   useEffect(() => {
@@ -556,12 +673,19 @@ export default function App() {
   useEffect(() => {
     let cancelled = false
     const hydratePreviews = async () => {
-      const conversations = await Promise.all(roles.map(async role => [role.id, await loadConversation(role.id)] as const))
-      if (!cancelled) setAllMessages(previous => ({ ...previous, ...Object.fromEntries(conversations) }))
+      const previews = await loadConversationPreviews(roleIds)
+      if (!cancelled) setAllMessages(previous => {
+        const next = { ...previous }
+        for (const [rawRoleId, preview] of Object.entries(previews)) {
+          const roleId = Number(rawRoleId)
+          if (!next[roleId]?.length) next[roleId] = preview ? [preview] : []
+        }
+        return next
+      })
     }
     void hydratePreviews()
     return () => { cancelled = true }
-  }, [roles.map(role => role.id).join(',')])
+  }, [roleIds])
 
   useEffect(() => {
     if (selectedId === null) return
@@ -572,26 +696,93 @@ export default function App() {
     return () => { cancelled = true }
   }, [selectedId])
 
-  useEffect(() => { localStorage.setItem('mchat2-roles', JSON.stringify(roles)) }, [roles])
+  useEffect(() => {
+    try {
+      localStorage.setItem('mchat2-roles', JSON.stringify({ version: 2, roles }))
+    } catch (error) {
+      console.error('保存角色索引失败', error)
+    }
+  }, [roles])
   useEffect(() => { saveAppPreferences(preferences) }, [preferences])
 
+  useEffect(() => {
+    configureConversationRuntime({
+      getRole: roleId => rolesRef.current.find(role => role.id === roleId) ?? null,
+      getPreferences: () => preferencesRef.current,
+      onMessagesUpdated: applyMessageUpdates,
+    })
+    void bootstrapConversationRuntimes(roleIds)
+  }, [roleIds])
+
+  useEffect(() => {
+    const openRole = (roleId: number) => {
+      if (!rolesRef.current.some(role => role.id === roleId)) return
+      runViewTransition(() => {
+        setPage('chat')
+        setSelectedId(roleId)
+        setRoleEditor(false)
+        setDraftRole(null)
+        setMobileConversations(false)
+        setRoles(current => current.map(role => role.id === roleId ? { ...role, unread: 0 } : role))
+      }, 'forward')
+    }
+    let listener: PluginListenerHandle | null = null
+    let disposed = false
+    void onNotificationOpened(openRole).then(handle => {
+      if (disposed && handle) void handle.remove()
+      else listener = handle
+    })
+    void consumePendingNotificationOpen().then(roleId => { if (roleId !== null) openRole(roleId) })
+    return () => {
+      disposed = true
+      if (listener) void listener.remove()
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!preferences.notificationsEnabled) return
+    let listener: PluginListenerHandle | null = null
+    let disposed = false
+    void CapacitorApp.addListener('appStateChange', event => {
+      if (!event.isActive) return
+      void checkNotificationPermission().then(granted => {
+        if (!granted) setPreferences(current => ({ ...current, notificationsEnabled: false }))
+      })
+    }).then(handle => {
+      if (disposed) void handle.remove()
+      else listener = handle
+    })
+    return () => {
+      disposed = true
+      if (listener) void listener.remove()
+    }
+  }, [preferences.notificationsEnabled])
+
   const reloadSelectedConversation = async () => {
-    const conversations = await Promise.all(roles.map(async role => [role.id, await loadConversation(role.id)] as const))
-    setAllMessages(previous => ({ ...previous, ...Object.fromEntries(conversations) }))
+    const previews = await loadConversationPreviews(roles.map(role => role.id))
+    const selected = selectedId === null ? null : await loadConversation(selectedId)
+    setAllMessages(previous => ({
+      ...previous,
+      ...Object.fromEntries(Object.entries(previews).map(([roleId, preview]) => [roleId, preview ? [preview] : []])),
+      ...(selectedId !== null && selected ? { [selectedId]: selected } : {}),
+    }))
+    await refreshConversationRuntimes(roleIds)
   }
 
   // 导入对话归档时恢复角色：优先用归档自带的角色定义，旧版归档（无角色定义）则按消息里
   // 出现的 roleId 建占位角色兜底。两种都只补齐本机不存在的角色，不覆盖用户已有编辑。
   // 返回实际新增的角色数量，供导入提示显示。
   const restoreImportedRoles = async (imported: Role[], orphanRoleIds: number[] = []): Promise<number> => {
+    const migratedImport = await migrateRoleUiAssets(imported)
+    const safeImported = migratedImport.roles
     const existing = new Set(roles.map(role => role.id))
-    const defined = new Set(imported.map(role => role.id))
+    const defined = new Set(safeImported.map(role => role.id))
     // 归档没给定义、本机也没有的 roleId，用默认值建占位角色（名字为“角色 #id”，可后续改名）。
     const placeholders = orphanRoleIds
       .filter(id => !defined.has(id) && !existing.has(id))
       .map(id => normalizeArchivedRole({ id }))
       .filter((role): role is Role => role !== null)
-    const missing = [...imported.filter(role => !existing.has(role.id)), ...placeholders]
+    const missing = [...safeImported.filter(role => !existing.has(role.id)), ...placeholders]
     if (!missing.length) return 0
     setRoles(current => {
       const have = new Set(current.map(role => role.id))
@@ -757,6 +948,7 @@ export default function App() {
   const deleteSelectedRole = async () => {
     if (!selectedRole) return
     await removeRoleData(selectedRole.id)
+    clearConversationRuntime(selectedRole.id)
     resetConversationRoundCount(selectedRole.id)
     const remaining = roles.filter(role => role.id !== selectedRole.id)
     runViewTransition(() => {
@@ -782,7 +974,6 @@ export default function App() {
         ? { ...role, unread: (role.unread || 0) + unreadReplies }
         : role))
     }
-    void saveConversationMessages(selectedId, newMessages)
   }
 
   // 后台会话事件：AI 回复由 ChatView 广播（即使已卸载），在此并入对应角色的消息状态，
@@ -826,16 +1017,6 @@ export default function App() {
     return () => document.removeEventListener('visibilitychange', syncActiveConversation)
   }, [mobileConversations, page, roleEditor, selectedId])
 
-  const updateSelectedMessages = (changedMessages: Message[]) => {
-    if (selectedId === null) return
-    const changed = new Map(changedMessages.map(message => [message.id, message]))
-    setAllMessages(previous => ({
-      ...previous,
-      [selectedId]: (previous[selectedId] || []).map(message => changed.get(message.id) ?? message),
-    }))
-    void updateConversationMessages(selectedId, changedMessages)
-  }
-
   const replaceSelectedGroup = (removedIds: number[], replacement: Message[]) => {
     if (selectedId === null) return
     const removed = new Set(removedIds)
@@ -856,6 +1037,7 @@ export default function App() {
     'app',
     dark ? 'dark-mode' : '',
     preferences.interfaceStyle === 'glass' ? 'glass-ui' : 'classic-ui',
+    preferences.reduceMotion ? 'reduce-motion' : '',
     appBackground?.image ? 'has-app-background' : '',
     page === 'chat' && !mobileConversations ? 'chat-open' : '',
     page === 'settings' ? 'viewing-settings' : '',
@@ -875,15 +1057,15 @@ export default function App() {
 
   return <div ref={outlineHighlightRef} className={appClass} style={appStyle}>
     {appBackground?.image && <div className="app-background" aria-hidden="true">
-      <img
+      <StoredImage
         className="app-background-fill"
-        src={appBackground.image}
+        source={appBackground.image}
         alt=""
         style={{ filter: `blur(${Math.max(14, appBackground.blur + 10)}px)` }}
       />
-      <img
+      <StoredImage
         className="app-background-focus"
-        src={appBackground.image}
+        source={appBackground.image}
         alt=""
         style={{ filter: `blur(${appBackground.blur}px)` }}
       />
@@ -905,7 +1087,6 @@ export default function App() {
         messages={messages[selectedRole.id] || []}
         preferences={preferences}
         appendMessages={appendSelectedMessages}
-        updateMessages={updateSelectedMessages}
         replaceMessageGroup={replaceSelectedGroup}
         openEditor={() => runViewTransition(() => setRoleEditor(true), 'forward')}
         onBack={() => runViewTransition(() => { setRoleEditor(false); setMobileConversations(true) }, 'back')}

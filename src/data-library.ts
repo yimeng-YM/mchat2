@@ -1,6 +1,12 @@
 ﻿import Dexie, { type EntityTable } from 'dexie'
 import { Capacitor, registerPlugin } from '@capacitor/core'
 import { removeNativeRoleFiles } from './device-features'
+import {
+  listUiAssetsForBackup,
+  removeRoleUiAssets,
+  restoreUiAssets,
+  type UiAsset as BackupUiAsset,
+} from './asset-storage'
 import { MEMORY_CATEGORIES } from './chat-types'
 import type { ChatAttachment, Message, Memory, MemoryInput, Role } from './chat-types'
 
@@ -54,13 +60,46 @@ export type EmojiAsset = {
   rawUri?: string
 }
 
+export type UiAsset = {
+  id: string
+  owner: string
+  mime: string
+  blob: Blob
+  createdAt: number
+}
+
+export type ConversationJob = {
+  roleId: number
+  state: 'inflight' | 'failed'
+  userMessageIds: number[]
+  createdAt: number
+  updatedAt: number
+  error?: string
+}
+
 export type ImportProgress = { processed: number; total: number; bytes?: number }
+
+const MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+const MAX_ARCHIVE_LINE_CHARS = 16 * 1024 * 1024
+const MAX_ARCHIVE_RECORDS = 2_000_000
+
+function validateArchiveFile(file: File) {
+  if (file.size <= 0) throw new Error('归档文件为空')
+  if (file.size > MAX_ARCHIVE_BYTES) throw new Error('归档文件超过 512 MB 安全限制')
+}
+
+function validateArchiveLine(line: string, recordCount: number) {
+  if (line.length > MAX_ARCHIVE_LINE_CHARS) throw new Error('归档中存在超过 16 MB 的异常记录')
+  if (recordCount > MAX_ARCHIVE_RECORDS) throw new Error('归档记录数超过安全限制')
+}
 
 class Mchat2Database extends Dexie {
   messages!: EntityTable<StoredMessage, 'key'>
   emojis!: EntityTable<EmojiAsset, 'id'>
   meta!: EntityTable<{ key: string; value: string }, 'key'>
   memories!: EntityTable<StoredMemory, 'id'>
+  uiAssets!: EntityTable<UiAsset, 'id'>
+  conversationJobs!: EntityTable<ConversationJob, 'roleId'>
 
   constructor() {
     super('mchat2-library')
@@ -72,10 +111,33 @@ class Mchat2Database extends Dexie {
     this.version(2).stores({
       memories: '&id,roleId,category,importance,createdAt,updatedAt,[roleId+category],[roleId+importance]',
     })
+    this.version(3).stores({
+      messages: '&key,roleId,createdAt,[roleId+createdAt]',
+      emojis: '&id,roleId,createdAt,[roleId+createdAt],name',
+      meta: '&key',
+      memories: '&id,roleId,category,importance,createdAt,updatedAt,[roleId+category],[roleId+importance]',
+      uiAssets: '&id,owner,createdAt',
+      conversationJobs: '&roleId,state,updatedAt',
+    })
   }
 }
 
 export const libraryDb = new Mchat2Database()
+
+export function messageFromStored(row: StoredMessage): Message {
+  return {
+    id: row.messageId,
+    createdAt: row.createdAt,
+    from: row.from,
+    text: row.text,
+    kind: row.kind,
+    groupId: row.groupId,
+    delivery: row.delivery,
+    attachment: row.attachment,
+    edited: row.edited,
+    time: row.time,
+  }
+}
 
 type NativeEmojiPage = { items: EmojiAsset[]; total: number; totalBytes: number }
 type NativeImportResult = { imported: number; failed: number; message?: string }
@@ -91,8 +153,17 @@ interface LargeMediaPlugin {
   saveTextExport(options: { token: string; name: string }): Promise<{ saved: boolean }>
   exportRolePack(options: { roleId: number; name: string }): Promise<{ exported: number; saved: boolean }>
   removeRole(options: { roleId: number }): Promise<void>
-  assembleBackup(options: { convToken: string; memToken: string; manifest: string; roleIds: number[] | null; name: string }): Promise<{ saved: boolean; emojis: number }>
-  pickBackup(): Promise<{ restored: boolean; conversationsPath?: string; memoriesPath?: string; emojis?: number }>
+  assembleBackup(options: { convToken: string; memToken: string; assetToken: string; manifest: string; roleIds: number[] | null; name: string }): Promise<{ saved: boolean; emojis: number; attachments: number }>
+  pickBackup(): Promise<{
+    restored: boolean
+    conversationsPath?: string
+    memoriesPath?: string
+    assetsPath?: string
+    attachmentRootUri?: string
+    manifest?: string
+    emojis?: number
+    attachments?: number
+  }>
 }
 
 const nativeMedia = registerPlugin<LargeMediaPlugin>('LargeMedia')
@@ -120,17 +191,7 @@ export async function seedConversationLibrary(seed: Record<number, Array<{ id: n
 
 export async function loadConversation(roleId: number, limit = 200) {
   const rows = await libraryDb.messages.where('[roleId+createdAt]').between([roleId, Dexie.minKey], [roleId, Dexie.maxKey]).reverse().limit(limit).toArray()
-  return rows.reverse().map(row => ({
-    id: row.messageId,
-    from: row.from,
-    text: row.text,
-    kind: row.kind,
-    groupId: row.groupId,
-    delivery: row.delivery,
-    attachment: row.attachment,
-    edited: row.edited,
-    time: row.time,
-  }))
+  return rows.reverse().map(messageFromStored)
 }
 
 export async function saveConversationMessages(roleId: number, messages: Message[]) {
@@ -147,7 +208,7 @@ export async function saveConversationMessages(roleId: number, messages: Message
     attachment: message.attachment,
     edited: message.edited,
     time: message.time,
-    createdAt: now - (messages.length - index),
+    createdAt: Number.isFinite(message.createdAt) ? Number(message.createdAt) : now - (messages.length - index),
   })))
 }
 
@@ -203,11 +264,13 @@ export async function trimConversation(roleId: number, keepRounds: number) {
 }
 
 export async function removeRoleData(roleId: number) {
-  await libraryDb.transaction('rw', libraryDb.messages, libraryDb.emojis, libraryDb.memories, async () => {
+  await libraryDb.transaction('rw', libraryDb.messages, libraryDb.emojis, libraryDb.memories, libraryDb.conversationJobs, async () => {
     await libraryDb.messages.where('roleId').equals(roleId).delete()
     if (!hasNativeMediaLibrary()) await libraryDb.emojis.where('roleId').equals(roleId).delete()
     await libraryDb.memories.where('roleId').equals(roleId).delete()
+    await libraryDb.conversationJobs.delete(roleId)
   })
+  await removeRoleUiAssets(roleId)
   if (hasNativeMediaLibrary()) await nativeMedia.removeRole({ roleId })
   await removeNativeRoleFiles(roleId)
 }
@@ -233,8 +296,8 @@ async function putMessageBatch(batch: StoredMessage[]) {
 
 function readStoredRoles(): Role[] {
   try {
-    const stored = JSON.parse(localStorage.getItem(ROLES_STORAGE_KEY) ?? '[]')
-    return Array.isArray(stored) ? stored as Role[] : []
+    const stored = JSON.parse(localStorage.getItem(ROLES_STORAGE_KEY) ?? '[]') as Role[] | { roles?: Role[] }
+    return Array.isArray(stored) ? stored : Array.isArray(stored.roles) ? stored.roles : []
   } catch {
     return []
   }
@@ -244,24 +307,28 @@ function readStoredRoles(): Role[] {
 export function normalizeArchivedRole(raw: Partial<Role> & { id: unknown }): Role | null {
   const id = Number(raw.id)
   if (!Number.isFinite(id) || !id) return null
+  const boundedNumber = (value: unknown, fallback: number, min: number, max: number) => {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback
+  }
   return {
     id,
-    name: typeof raw.name === 'string' && raw.name.trim() ? raw.name : `角色 #${id}`,
-    avatar: typeof raw.avatar === 'string' && raw.avatar ? raw.avatar : '/avatars/default-role.svg',
-    signature: typeof raw.signature === 'string' ? raw.signature : '',
-    relation: typeof raw.relation === 'string' ? raw.relation : '',
-    status: typeof raw.status === 'string' ? raw.status : '',
-    tags: Array.isArray(raw.tags) ? raw.tags.filter((tag): tag is string => typeof tag === 'string') : [],
+    name: typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 128) : `角色 #${id}`,
+    avatar: typeof raw.avatar === 'string' && raw.avatar.length <= MAX_ARCHIVE_LINE_CHARS ? raw.avatar : '/avatars/default-role.svg',
+    signature: typeof raw.signature === 'string' ? raw.signature.slice(0, 1_000) : '',
+    relation: typeof raw.relation === 'string' ? raw.relation.slice(0, 256) : '',
+    status: typeof raw.status === 'string' ? raw.status.slice(0, 256) : '',
+    tags: Array.isArray(raw.tags) ? raw.tags.filter((tag): tag is string => typeof tag === 'string').slice(0, 50).map(tag => tag.slice(0, 64)) : [],
     unread: 0,
     last: typeof raw.last === 'string' ? raw.last : '',
     time: typeof raw.time === 'string' ? raw.time : '',
     online: typeof raw.online === 'boolean' ? raw.online : true,
-    persona: typeof raw.persona === 'string' ? raw.persona : '',
+    persona: typeof raw.persona === 'string' ? raw.persona.slice(0, 200_000) : '',
     background: raw.background && typeof raw.background === 'object'
       ? {
-          image: typeof raw.background.image === 'string' ? raw.background.image : '',
-          blur: Number.isFinite(Number(raw.background.blur)) ? Number(raw.background.blur) : 0,
-          overlay: Number.isFinite(Number(raw.background.overlay)) ? Number(raw.background.overlay) : 0,
+          image: typeof raw.background.image === 'string' && raw.background.image.length <= MAX_ARCHIVE_LINE_CHARS ? raw.background.image : '',
+          blur: boundedNumber(raw.background.blur, 0, 0, 20),
+          overlay: boundedNumber(raw.background.overlay, 0, 0, 85),
         }
       : undefined,
   }
@@ -275,6 +342,7 @@ function buildRoleChunk(selectedRoleIds?: number[]): string {
 }
 
 export async function inspectConversationArchive(file: File) {
+  validateArchiveFile(file)
   const reader = file.stream().getReader()
   const decoder = new TextDecoder()
   const counts: Record<number, number> = {}
@@ -282,6 +350,7 @@ export async function inspectConversationArchive(file: File) {
   const consume = (rawLine: string) => {
     const line = rawLine.trim()
     if (!line) return
+    validateArchiveLine(line, Object.values(counts).reduce((sum, count) => sum + count, 0))
     const item = JSON.parse(line) as Partial<StoredMessage> & { type?: string }
     if (item.type === 'mchat2-archive' || item.type === 'mchat2-role') return
     const roleId = Number(item.roleId)
@@ -301,7 +370,13 @@ export async function inspectConversationArchive(file: File) {
   return counts
 }
 
-export async function importConversationArchive(file: File, onProgress: (progress: ImportProgress) => void, selectedRoleIds?: number[]) {
+export async function importConversationArchive(
+  file: File,
+  onProgress: (progress: ImportProgress) => void,
+  selectedRoleIds?: number[],
+  attachmentRootUri?: string,
+) {
+  validateArchiveFile(file)
   const reader = file.stream().getReader()
   const decoder = new TextDecoder()
   const selected = selectedRoleIds?.length ? new Set(selectedRoleIds) : null
@@ -316,6 +391,7 @@ export async function importConversationArchive(file: File, onProgress: (progres
   const consumeLine = async (rawLine: string) => {
     const line = rawLine.trim()
     if (!line) return
+    validateArchiveLine(line, scanned)
     const item = JSON.parse(line) as Partial<StoredMessage> & { type?: string }
     if (item.type === 'mchat2-archive') return
     if (item.type === 'mchat2-role') {
@@ -328,16 +404,42 @@ export async function importConversationArchive(file: File, onProgress: (progres
     if (selected && !selected.has(Number(item.roleId))) return
     messageRoleIds.add(Number(item.roleId))
     const messageId = Number(item.messageId ?? Date.now() + processed)
+    const roleId = Number(item.roleId)
+    const attachment = item.kind === 'attachment' && item.attachment && typeof item.attachment === 'object'
+      ? (() => {
+          const raw = item.attachment as ChatAttachment
+          if (
+            raw.kind !== 'image'
+            || !/^[\p{L}\p{N}._-]{1,220}$/u.test(String(raw.id ?? ''))
+            || typeof raw.name !== 'string'
+            || typeof raw.mime !== 'string'
+          ) return undefined
+          const normalized: ChatAttachment = {
+            id: raw.id,
+            kind: 'image',
+            name: raw.name.slice(0, 240),
+            mime: raw.mime.startsWith('image/') ? raw.mime.slice(0, 100) : 'image/jpeg',
+            size: Math.max(0, Number.isFinite(Number(raw.size)) ? Number(raw.size) : 0),
+          }
+          if (attachmentRootUri) {
+            const rawUri = `${attachmentRootUri.replace(/\/+$/, '')}/${roleId}/${raw.id}`
+            return { ...normalized, rawUri, uri: Capacitor.convertFileSrc(rawUri) }
+          }
+          if (typeof raw.rawUri === 'string' && raw.rawUri.startsWith('file://')) normalized.rawUri = raw.rawUri
+          if (typeof raw.uri === 'string' && /^(https?:|blob:|data:image\/|file:)/.test(raw.uri)) normalized.uri = raw.uri
+          return normalized
+        })()
+      : undefined
     batch.push({
       key: `${item.roleId}:${messageId}`,
-      roleId: Number(item.roleId),
+      roleId,
       messageId,
       from: item.from,
       text: String(item.text),
       kind: item.kind === 'emoji' || item.kind === 'attachment' ? item.kind : undefined,
       groupId: item.groupId,
       delivery: item.delivery,
-      attachment: item.attachment,
+      attachment,
       edited: item.edited,
       time: String(item.time ?? ''),
       createdAt: Number(item.createdAt ?? Date.now() + processed),
@@ -635,6 +737,7 @@ export async function getMemoryStats(): Promise<MemoryStats> {
 }
 
 export async function inspectMemoryArchive(file: File) {
+  validateArchiveFile(file)
   const reader = file.stream().getReader()
   const decoder = new TextDecoder()
   const counts: Record<number, number> = {}
@@ -642,6 +745,7 @@ export async function inspectMemoryArchive(file: File) {
   const consume = (rawLine: string) => {
     const line = rawLine.trim()
     if (!line) return
+    validateArchiveLine(line, Object.values(counts).reduce((sum, count) => sum + count, 0))
     const item = JSON.parse(line) as Partial<StoredMemory> & { type?: string }
     if (item.type === 'mchat2-memory-archive') return
     const roleId = Number(item.roleId)
@@ -662,6 +766,7 @@ export async function inspectMemoryArchive(file: File) {
 }
 
 export async function importMemoryArchive(file: File, onProgress: (p: ImportProgress) => void, selectedRoleIds?: number[]) {
+  validateArchiveFile(file)
   const reader = file.stream().getReader()
   const decoder = new TextDecoder()
   const selected = selectedRoleIds?.length ? new Set(selectedRoleIds) : null
@@ -674,6 +779,7 @@ export async function importMemoryArchive(file: File, onProgress: (p: ImportProg
   const consumeLine = async (rawLine: string) => {
     const line = rawLine.trim()
     if (!line) return
+    validateArchiveLine(line, processed)
     const item = JSON.parse(line) as Partial<StoredMemory> & { type?: string }
     if (item.type === 'mchat2-memory-archive') return
     if (!item.roleId || !item.content) return
@@ -744,8 +850,68 @@ export type FullBackupResult = {
   processed: number
   memoriesImported: number
   emojis: number
+  attachments: number
   roles: Role[]
   orphanRoleIds: number[]
+  settings?: unknown
+}
+
+async function importUiAssetArchive(file: File, onProgress: (progress: ImportProgress) => void, validateOnly = false) {
+  validateArchiveFile(file)
+  const reader = file.stream().getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let processed = 0
+  let bytes = 0
+  let batch: BackupUiAsset[] = []
+  const consume = async (rawLine: string) => {
+    const line = rawLine.trim()
+    if (!line) return
+    validateArchiveLine(line, processed)
+    const item = JSON.parse(line) as Partial<BackupUiAsset> & { type?: string; version?: number; data?: unknown }
+    if (item.type === 'mchat2-ui-assets') {
+      if (item.version !== 1) throw new Error('界面资源归档版本不受支持')
+      return
+    }
+    if (
+      typeof item.id !== 'string'
+      || !/^[A-Za-z0-9._-]{1,120}$/.test(item.id)
+      || typeof item.owner !== 'string'
+      || !/^(user:avatar|role:\d+:(avatar|background))$/.test(item.owner)
+      || typeof item.data !== 'string'
+      || !item.data.startsWith('data:image/')
+    ) {
+      throw new Error(`第 ${processed + 1} 条界面资源无效`)
+    }
+    const blob = await fetch(item.data).then(response => response.blob())
+    if (blob.size > 16 * 1024 * 1024) throw new Error('单个界面资源超过 16 MB 安全限制')
+    batch.push({
+      id: item.id,
+      owner: item.owner,
+      mime: typeof item.mime === 'string' ? item.mime : blob.type || 'image/webp',
+      blob,
+      createdAt: Number.isFinite(item.createdAt) ? Number(item.createdAt) : Date.now(),
+    })
+    processed += 1
+    if (batch.length >= 50) {
+      if (!validateOnly) await restoreUiAssets(batch)
+      batch = []
+      onProgress({ processed, total: 0, bytes })
+    }
+  }
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    bytes += value.byteLength
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() ?? ''
+    for (const line of lines) await consume(line)
+  }
+  buffer += decoder.decode()
+  if (buffer.trim()) await consume(buffer)
+  if (batch.length && !validateOnly) await restoreUiAssets(batch)
+  onProgress({ processed, total: processed, bytes })
 }
 
 // 把对话归档（含角色定义）分块写进原生文本导出 token，格式与 exportConversationArchive 一致。
@@ -776,38 +942,118 @@ async function writeMemoriesToToken(token: string, selectedRoleIds?: number[]) {
   }
 }
 
-export async function exportFullBackup(selectedRoleIds?: number[]) {
+async function blobDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result ?? ''))
+    reader.onerror = () => reject(reader.error ?? new Error('无法读取界面资源'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+async function writeUiAssetsToToken(token: string, selectedRoleIds?: number[]) {
+  await nativeMedia.appendTextExport({ token, chunk: `${JSON.stringify({ type: 'mchat2-ui-assets', version: 1 })}\n` })
+  const assets = await listUiAssetsForBackup(selectedRoleIds)
+  for (const asset of assets) {
+    await nativeMedia.appendTextExport({
+      token,
+      chunk: `${JSON.stringify({
+        id: asset.id,
+        owner: asset.owner,
+        mime: asset.mime,
+        createdAt: asset.createdAt,
+        data: await blobDataUrl(asset.blob),
+      })}\n`,
+    })
+  }
+}
+
+export async function exportFullBackup(selectedRoleIds?: number[], settings?: unknown) {
   if (!hasNativeMediaLibrary()) throw new Error('完整备份仅在 App 内可用')
   const backupName = `MChat2-完整备份-${new Date().toISOString().slice(0, 10)}.zip`
   const { token: convToken } = await nativeMedia.beginTextExport({ name: 'conversations.ndjson' })
   await writeConversationsToToken(convToken, selectedRoleIds)
   const { token: memToken } = await nativeMedia.beginTextExport({ name: 'memories.ndjson' })
   await writeMemoriesToToken(memToken, selectedRoleIds)
+  const { token: assetToken } = await nativeMedia.beginTextExport({ name: 'assets.ndjson' })
+  await writeUiAssetsToToken(assetToken, selectedRoleIds)
   const roleIds = selectedRoleIds?.length ? selectedRoleIds : null
+  const selected = roleIds ? new Set(roleIds) : null
+  const conversationJobs = (await libraryDb.conversationJobs.toArray())
+    .filter(job => !selected || selected.has(job.roleId))
   const manifest = JSON.stringify({
     type: 'mchat2-full-backup',
-    version: 1,
+    version: 2,
     exportedAt: new Date().toISOString(),
     roleCount: roleIds ? roleIds.length : readStoredRoles().length,
+    settings,
+    conversationJobs,
   })
-  return nativeMedia.assembleBackup({ convToken, memToken, manifest, roleIds, name: backupName })
+  return nativeMedia.assembleBackup({ convToken, memToken, assetToken, manifest, roleIds, name: backupName })
 }
 
 export async function importFullBackup(onProgress: (progress: ImportProgress) => void): Promise<FullBackupResult | null> {
   if (!hasNativeMediaLibrary()) throw new Error('完整备份仅在 App 内可用')
   const picked = await nativeMedia.pickBackup()
   if (!picked.restored) return null // 用户取消
-  const fetchArchive = async (path?: string) => {
+  const fetchArchive = async (path?: string, name = 'archive.ndjson') => {
     if (!path) return null
     const response = await fetch(Capacitor.convertFileSrc(path))
-    return new File([await response.blob()], 'archive.ndjson')
+    if (!response.ok) throw new Error(`无法读取备份中的 ${name}`)
+    return new File([await response.blob()], name)
   }
-  const conversationsFile = await fetchArchive(picked.conversationsPath)
-  const memoriesFile = await fetchArchive(picked.memoriesPath)
+  const conversationsFile = await fetchArchive(picked.conversationsPath, 'conversations.ndjson')
+  const memoriesFile = await fetchArchive(picked.memoriesPath, 'memories.ndjson')
+  const assetsFile = await fetchArchive(picked.assetsPath, 'assets.ndjson')
+  let settings: unknown
+  let restoredJobs: ConversationJob[] = []
+  if (picked.manifest) {
+    const parsed = JSON.parse(picked.manifest) as {
+      type?: string
+      version?: number
+      settings?: unknown
+      conversationJobs?: unknown
+    }
+    if (parsed.type !== 'mchat2-full-backup' || (parsed.version !== 1 && parsed.version !== 2)) throw new Error('备份清单版本不受支持')
+    settings = parsed.settings
+    if (Array.isArray(parsed.conversationJobs)) {
+      restoredJobs = parsed.conversationJobs.flatMap(raw => {
+        if (!raw || typeof raw !== 'object') return []
+        const job = raw as Partial<ConversationJob>
+        const roleId = Number(job.roleId)
+        const userMessageIds = Array.isArray(job.userMessageIds)
+          ? job.userMessageIds.map(Number).filter(Number.isFinite)
+          : []
+        if (!Number.isFinite(roleId) || roleId <= 0 || !userMessageIds.length) return []
+        const now = Date.now()
+        return [{
+          roleId,
+          state: 'failed' as const,
+          userMessageIds,
+          createdAt: Number.isFinite(job.createdAt) ? Number(job.createdAt) : now,
+          updatedAt: now,
+          error: '该回复任务从备份恢复，可点击重试。',
+        }]
+      })
+    }
+  }
+  if (conversationsFile) await inspectConversationArchive(conversationsFile)
+  if (memoriesFile) await inspectMemoryArchive(memoriesFile)
+  if (assetsFile) await importUiAssetArchive(assetsFile, () => {}, true)
   // 完整备份统一全量恢复（导出时已按角色筛选过）。
   const { processed, roles, orphanRoleIds } = conversationsFile
-    ? await importConversationArchive(conversationsFile, onProgress)
+    ? await importConversationArchive(conversationsFile, onProgress, undefined, picked.attachmentRootUri)
     : { processed: 0, roles: [] as Role[], orphanRoleIds: [] as number[] }
   const memoriesImported = memoriesFile ? await importMemoryArchive(memoriesFile, onProgress) : 0
-  return { processed, memoriesImported, emojis: picked.emojis ?? 0, roles, orphanRoleIds }
+  if (assetsFile) await importUiAssetArchive(assetsFile, onProgress)
+  if (restoredJobs.length) await libraryDb.conversationJobs.bulkPut(restoredJobs)
+  return {
+    processed,
+    memoriesImported,
+    emojis: picked.emojis ?? 0,
+    attachments: picked.attachments ?? 0,
+    roles,
+    orphanRoleIds,
+    settings,
+  }
 }

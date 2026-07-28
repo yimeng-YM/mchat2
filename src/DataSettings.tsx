@@ -16,6 +16,10 @@ import type { Role } from './chat-types'
 import type { AppPreferences } from './preferences'
 import { UserAvatar } from './UserAvatar'
 import { runViewTransition } from './view-transitions'
+import { persistUiAsset } from './asset-storage'
+import { createBackupSettings, normalizeBackupSettings } from './backup-settings'
+import { loadModelConfig, saveModelConfig } from './ai-service'
+import { loadMemoryModelConfig, saveMemoryModelConfig } from './preferences'
 
 type DataRole = { id: number; name: string; avatar: string }
 type SelectionKind = 'conversation' | 'memory'
@@ -165,8 +169,11 @@ export function DataSettings({ roles, preferences, onPreferencesChange, onChange
     runViewTransition(() => setBackupOpen(false))
     setBusy(true)
     try {
-      const result = await exportFullBackup(allSelected ? undefined : backupIds)
-      if (result.saved) showNotice('success', `已备份 ${allSelected ? '全部' : backupIds.length + ' 个'}角色，含 ${result.emojis.toLocaleString()} 张表情`)
+      const result = await exportFullBackup(
+        allSelected ? undefined : backupIds,
+        createBackupSettings(preferences, loadModelConfig(), loadMemoryModelConfig()),
+      )
+      if (result.saved) showNotice('success', `已备份 ${allSelected ? '全部' : backupIds.length + ' 个'}角色，含 ${result.emojis.toLocaleString()} 张表情、${result.attachments.toLocaleString()} 个附件`)
     } catch (error) {
       showNotice('error', error instanceof Error ? error.message : '备份失败')
     } finally {
@@ -180,10 +187,24 @@ export function DataSettings({ roles, preferences, onPreferencesChange, onChange
     try {
       const result = await importFullBackup(setProgress)
       if (!result) return // 用户取消
+      const restoredSettings = normalizeBackupSettings(
+        result.settings,
+        preferences,
+        loadModelConfig(),
+        loadMemoryModelConfig(),
+      )
+      if (restoredSettings) {
+        const userAvatar = await persistUiAsset(restoredSettings.preferences.userAvatar, 'user:avatar')
+        onPreferencesChange({ ...restoredSettings.preferences, userAvatar })
+        await Promise.all([
+          saveModelConfig(restoredSettings.model),
+          saveMemoryModelConfig(restoredSettings.memoryModel),
+        ])
+      }
       await onRolesImported(result.roles, result.orphanRoleIds)
       await refresh()
       await onChanged()
-      showNotice('success', `已恢复 ${result.processed.toLocaleString()} 条对话、${result.memoriesImported.toLocaleString()} 条记忆、${result.emojis.toLocaleString()} 张表情`)
+      showNotice('success', `已恢复 ${result.processed.toLocaleString()} 条对话、${result.memoriesImported.toLocaleString()} 条记忆、${result.emojis.toLocaleString()} 张表情、${result.attachments.toLocaleString()} 个附件`)
     } catch (error) {
       showNotice('error', error instanceof Error ? error.message : '恢复失败')
     } finally {
@@ -230,6 +251,17 @@ export function DataSettings({ roles, preferences, onPreferencesChange, onChange
     if (avatarInput.current) avatarInput.current.value = ''
   }
 
+  const saveUserAvatar = async (avatar: string) => {
+    try {
+      const stored = await persistUiAsset(avatar, 'user:avatar')
+      onPreferencesChange({ ...preferences, userAvatar: stored })
+      runViewTransition(() => setCropFile(null))
+      showNotice('success', '用户头像已更新')
+    } catch (error) {
+      showNotice('error', error instanceof Error ? error.message : '保存用户头像失败')
+    }
+  }
+
   const total = Object.values(counts).reduce((sum, count) => sum + count, 0)
   const activeMemories = memoryStats.total - memoryStats.archived
   const roleName = (id: number) => roles.find(role => role.id === id)?.name ?? `未知角色 #${id}`
@@ -258,7 +290,7 @@ export function DataSettings({ roles, preferences, onPreferencesChange, onChange
           <button className="primary" onClick={() => void restoreBackup()} disabled={busy}><HardDriveDownload />恢复备份</button>
         </div>
       </div>
-      <div className="data-summary"><Package /><div><strong>一个文件包含全部数据</strong><span>恢复时会新增缺失的角色，不覆盖已有角色的编辑</span></div><b>.zip</b></div>
+      <div className="data-summary"><Package /><div><strong>一个文件包含角色、对话、附件、记忆与界面设置</strong><span>出于安全考虑不导出 API Key；恢复时不会覆盖已有角色的编辑</span></div><b>.zip</b></div>
     </section>}
 
     <section className="setting-group profile-settings">
@@ -348,7 +380,7 @@ export function DataSettings({ roles, preferences, onPreferencesChange, onChange
 
     {backupOpen && <OverlayPortal><div className="dialog-overlay" role="dialog" aria-modal="true" aria-labelledby="backup-selection-title">
       <section className="data-selection-dialog">
-        <header><div><h2 id="backup-selection-title">选择备份角色</h2><p>勾选要打包的角色，将一并备份其对话、提示词、长期记忆和表情包</p></div><button className="icon-btn" onClick={() => runViewTransition(() => setBackupOpen(false))} aria-label="关闭"><X /></button></header>
+        <header><div><h2 id="backup-selection-title">选择备份角色</h2><p>勾选要打包的角色，将一并备份其对话、附件、提示词、长期记忆和表情包</p></div><button className="icon-btn" onClick={() => runViewTransition(() => setBackupOpen(false))} aria-label="关闭"><X /></button></header>
         <div className="data-selection-actions">
           <button onClick={() => setBackupIds(backupCandidates.map(role => role.id))}>全选</button>
           <button onClick={() => setBackupIds([])}>清空</button>
@@ -377,6 +409,6 @@ export function DataSettings({ roles, preferences, onPreferencesChange, onChange
       <p>{keepRounds === 0 ? '当前设置会删除全部对话记录。' : '每一轮从你的一组消息开始，并包含紧随其后的角色回复。'}</p>
     </ConfirmDialog>}
     {memoryDeleteRole && <ConfirmDialog title={`清空「${memoryDeleteRole.name}」的长期记忆？`} description={`将永久删除 ${(memoryStats.byRole[memoryDeleteRole.id]?.total ?? 0).toLocaleString()} 条记忆，包括已归档内容。`} confirmLabel="清空长期记忆" destructive onCancel={() => setMemoryDeleteRole(null)} onConfirm={() => void clearRoleMemories()} />}
-    {cropFile && <AvatarCropper file={cropFile} onCancel={() => setCropFile(null)} onConfirm={avatar => runViewTransition(() => { onPreferencesChange({ ...preferences, userAvatar: avatar }); setCropFile(null); showNotice('success', '用户头像已更新') })} />}
+    {cropFile && <AvatarCropper file={cropFile} onCancel={() => setCropFile(null)} onConfirm={avatar => void saveUserAvatar(avatar)} />}
   </div>
 }

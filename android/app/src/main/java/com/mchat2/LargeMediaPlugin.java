@@ -28,6 +28,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -46,6 +47,11 @@ import java.util.zip.ZipOutputStream;
 
 @CapacitorPlugin(name = "LargeMedia")
 public class LargeMediaPlugin extends Plugin {
+    private static final int MAX_ZIP_ENTRIES = 50_000;
+    private static final long MAX_BACKUP_EXTRACTED_BYTES = 2L * 1024 * 1024 * 1024;
+    private static final long MAX_ARCHIVE_ENTRY_BYTES = 512L * 1024 * 1024;
+    private static final long MAX_MEDIA_ENTRY_BYTES = 128L * 1024 * 1024;
+    private static final long MAX_MANIFEST_BYTES = 256L * 1024;
     private final ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
     private final Map<String, File> pendingTextExports = new ConcurrentHashMap<>();
     private MediaDatabase mediaDatabase;
@@ -311,7 +317,9 @@ public class LargeMediaPlugin extends Plugin {
     public void assembleBackup(PluginCall call) {
         String convToken = call.getString("convToken", "");
         String memToken = call.getString("memToken", "");
-        if (!pendingTextExports.containsKey(convToken) || !pendingTextExports.containsKey(memToken)) {
+        String assetToken = call.getString("assetToken", "");
+        if (!pendingTextExports.containsKey(convToken) || !pendingTextExports.containsKey(memToken)
+            || !pendingTextExports.containsKey(assetToken)) {
             call.reject("备份数据已失效，请重试");
             return;
         }
@@ -326,12 +334,19 @@ public class LargeMediaPlugin extends Plugin {
     private void assembleBackupResult(PluginCall call, ActivityResult result) {
         String convToken = call.getString("convToken", "");
         String memToken = call.getString("memToken", "");
+        String assetToken = call.getString("assetToken", "");
         File conversations = pendingTextExports.remove(convToken);
         File memories = pendingTextExports.remove(memToken);
+        File assets = pendingTextExports.remove(assetToken);
         if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null || result.getData().getData() == null) {
             if (conversations != null) conversations.delete();
             if (memories != null) memories.delete();
-            JSObject response = new JSObject(); response.put("saved", false); response.put("emojis", 0); call.resolve(response);
+            if (assets != null) assets.delete();
+            JSObject response = new JSObject();
+            response.put("saved", false);
+            response.put("emojis", 0);
+            response.put("attachments", 0);
+            call.resolve(response);
             return;
         }
         String manifest = call.getString("manifest", "{}");
@@ -339,25 +354,30 @@ public class LargeMediaPlugin extends Plugin {
         Uri destination = result.getData().getData();
         ioExecutor.execute(() -> {
             try {
-                if (conversations == null || memories == null) throw new IllegalStateException("备份临时文件缺失");
+                if (conversations == null || memories == null || assets == null) throw new IllegalStateException("备份临时文件缺失");
                 OutputStream rawOutput = getContext().getContentResolver().openOutputStream(destination);
                 if (rawOutput == null) throw new IllegalStateException("无法打开保存位置");
                 int emojis;
+                int attachments;
                 try (ZipOutputStream zip = new ZipOutputStream(rawOutput)) {
                     writeZipText(zip, "manifest.json", manifest);
                     writeZipFile(zip, "conversations.ndjson", conversations);
                     writeZipFile(zip, "memories.ndjson", memories);
+                    writeZipFile(zip, "assets.ndjson", assets);
                     emojis = mediaDatabase.exportBackup(zip, roleFilter);
+                    attachments = exportChatAttachments(zip, roleFilter);
                 }
                 JSObject response = new JSObject();
                 response.put("saved", true);
                 response.put("emojis", emojis);
+                response.put("attachments", attachments);
                 call.resolve(response);
             } catch (Exception error) {
                 call.reject("生成备份失败", error);
             } finally {
-                conversations.delete();
-                memories.delete();
+                if (conversations != null) conversations.delete();
+                if (memories != null) memories.delete();
+                if (assets != null) assets.delete();
             }
         });
     }
@@ -386,8 +406,12 @@ public class LargeMediaPlugin extends Plugin {
                 if (!workDir.mkdirs()) throw new IllegalStateException("无法创建恢复目录");
                 File conversations = new File(workDir, "conversations.ndjson");
                 File memories = new File(workDir, "memories.ndjson");
+                File assets = new File(workDir, "assets.ndjson");
                 Map<String, JSONObject> emojiMeta = new HashMap<>();
                 List<String[]> stagedEmojis = new ArrayList<>(); // {roleId, fileId, path}
+                List<String[]> stagedAttachments = new ArrayList<>(); // {roleId, fileId, path}
+                ExtractionBudget budget = new ExtractionBudget();
+                String manifest = null;
 
                 InputStream rawInput = getContext().getContentResolver().openInputStream(source);
                 if (rawInput == null) throw new IllegalStateException("无法读取备份文件");
@@ -395,37 +419,69 @@ public class LargeMediaPlugin extends Plugin {
                     ZipEntry entry;
                     byte[] buffer = new byte[1024 * 1024];
                     while ((entry = zip.getNextEntry()) != null) {
+                        budget.entries += 1;
+                        if (budget.entries > MAX_ZIP_ENTRIES) throw new IllegalStateException("备份文件条目数超过安全限制");
                         String entryName = entry.getName();
                         if (entry.isDirectory()) { zip.closeEntry(); continue; }
-                        if ("conversations.ndjson".equals(entryName)) {
-                            writeStreamToFile(zip, conversations, buffer);
+                        if ("manifest.json".equals(entryName)) {
+                            manifest = readZipText(zip, budget, MAX_MANIFEST_BYTES);
+                        } else if ("conversations.ndjson".equals(entryName)) {
+                            writeStreamToFile(zip, conversations, buffer, budget, MAX_ARCHIVE_ENTRY_BYTES);
                         } else if ("memories.ndjson".equals(entryName)) {
-                            writeStreamToFile(zip, memories, buffer);
+                            writeStreamToFile(zip, memories, buffer, budget, MAX_ARCHIVE_ENTRY_BYTES);
+                        } else if ("assets.ndjson".equals(entryName)) {
+                            writeStreamToFile(zip, assets, buffer, budget, MAX_ARCHIVE_ENTRY_BYTES);
                         } else if ("emoji-index.ndjson".equals(entryName)) {
-                            readEmojiIndex(zip, emojiMeta);
+                            readEmojiIndex(zip, emojiMeta, budget);
                         } else if (entryName.startsWith("emoji/")) {
                             // emoji/<roleId>/<fileId>
                             String[] parts = entryName.split("/");
                             if (parts.length != 3 || parts[1].isEmpty() || parts[2].isEmpty()) { zip.closeEntry(); continue; }
                             long roleId;
                             try { roleId = Long.parseLong(parts[1]); } catch (NumberFormatException nfe) { zip.closeEntry(); continue; }
-                            File directory = roleDirectory(roleId);
+                            if (roleId <= 0 || !safeArchiveFileName(parts[2])) { zip.closeEntry(); continue; }
+                            File directory = new File(workDir, "emoji-stage/" + roleId);
                             if (!directory.exists() && !directory.mkdirs()) { zip.closeEntry(); continue; }
-                            File target = new File(directory, parts[2]);
-                            writeStreamToFile(zip, target, buffer);
+                            File target = safeArchiveTarget(directory, parts[2]);
+                            writeStreamToFile(zip, target, buffer, budget, MAX_MEDIA_ENTRY_BYTES);
                             stagedEmojis.add(new String[]{parts[1], parts[2], target.getAbsolutePath()});
+                        } else if (entryName.startsWith("attachments/")) {
+                            String[] parts = entryName.split("/");
+                            if (parts.length != 3 || !safeArchiveFileName(parts[2])) { zip.closeEntry(); continue; }
+                            long roleId;
+                            try { roleId = Long.parseLong(parts[1]); } catch (NumberFormatException nfe) { zip.closeEntry(); continue; }
+                            if (roleId <= 0) { zip.closeEntry(); continue; }
+                            File directory = new File(workDir, "attachment-stage/" + roleId);
+                            if (!directory.exists() && !directory.mkdirs()) throw new IllegalStateException("无法创建附件恢复目录");
+                            File target = safeArchiveTarget(directory, parts[2]);
+                            writeStreamToFile(zip, target, buffer, budget, MAX_MEDIA_ENTRY_BYTES);
+                            stagedAttachments.add(new String[]{parts[1], parts[2], target.getAbsolutePath()});
                         }
                         zip.closeEntry();
                     }
                 }
 
+                if (manifest == null) throw new IllegalStateException("备份缺少 manifest.json");
+                JSONObject manifestObject = new JSONObject(manifest);
+                int version = manifestObject.optInt("version", 0);
+                if (!"mchat2-full-backup".equals(manifestObject.optString("type")) || (version != 1 && version != 2)) {
+                    throw new IllegalStateException("备份清单格式或版本不受支持");
+                }
+                commitStagedFiles(stagedEmojis, mediaRoot());
+                File attachmentRoot = new File(getContext().getFilesDir(), "chat-attachments");
+                commitStagedFiles(stagedAttachments, attachmentRoot);
                 int restoredEmojis = mediaDatabase.restoreEmojis(stagedEmojis, emojiMeta);
+                int restoredAttachments = stagedAttachments.size();
                 JSObject response = new JSObject();
                 response.put("restored", true);
                 // 返回 file:// URI，供 JS 端 Capacitor.convertFileSrc 转成 WebView 可 fetch 的地址。
                 response.put("conversationsPath", conversations.isFile() ? Uri.fromFile(conversations).toString() : "");
                 response.put("memoriesPath", memories.isFile() ? Uri.fromFile(memories).toString() : "");
+                response.put("assetsPath", assets.isFile() ? Uri.fromFile(assets).toString() : "");
+                response.put("attachmentRootUri", Uri.fromFile(attachmentRoot).toString());
+                response.put("manifest", manifest);
                 response.put("emojis", restoredEmojis);
+                response.put("attachments", restoredAttachments);
                 call.resolve(response);
             } catch (Exception error) {
                 call.reject("恢复备份失败", error);
@@ -455,17 +511,49 @@ public class LargeMediaPlugin extends Plugin {
         zip.closeEntry();
     }
 
-    private void writeStreamToFile(InputStream input, File target, byte[] buffer) throws Exception {
+    private static class ExtractionBudget {
+        long bytes = 0;
+        int entries = 0;
+    }
+
+    private void writeStreamToFile(
+        InputStream input,
+        File target,
+        byte[] buffer,
+        ExtractionBudget budget,
+        long maxEntryBytes
+    ) throws Exception {
+        long entryBytes = 0;
         try (FileOutputStream output = new FileOutputStream(target)) {
             int read;
-            while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
+            while ((read = input.read(buffer)) != -1) {
+                entryBytes += read;
+                budget.bytes += read;
+                if (entryBytes > maxEntryBytes || budget.bytes > MAX_BACKUP_EXTRACTED_BYTES) {
+                    throw new IllegalStateException("备份解压大小超过安全限制");
+                }
+                output.write(buffer, 0, read);
+            }
         }
     }
 
-    private void readEmojiIndex(InputStream input, Map<String, JSONObject> meta) throws Exception {
-        java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(input, StandardCharsets.UTF_8));
-        String line;
-        while ((line = reader.readLine()) != null) {
+    private String readZipText(InputStream input, ExtractionBudget budget, long maxBytes) throws Exception {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        byte[] buffer = new byte[64 * 1024];
+        int read;
+        while ((read = input.read(buffer)) != -1) {
+            budget.bytes += read;
+            if (output.size() + read > maxBytes || budget.bytes > MAX_BACKUP_EXTRACTED_BYTES) {
+                throw new IllegalStateException("备份文本条目超过安全限制");
+            }
+            output.write(buffer, 0, read);
+        }
+        return output.toString(StandardCharsets.UTF_8.name());
+    }
+
+    private void readEmojiIndex(InputStream input, Map<String, JSONObject> meta, ExtractionBudget budget) throws Exception {
+        String[] lines = readZipText(input, budget, 32L * 1024 * 1024).split("\\r?\\n");
+        for (String line : lines) {
             String trimmed = line.trim();
             if (trimmed.isEmpty()) continue;
             try {
@@ -474,6 +562,57 @@ public class LargeMediaPlugin extends Plugin {
                 meta.put(key, item);
             } catch (Exception ignored) {}
         }
+    }
+
+    private boolean safeArchiveFileName(String name) {
+        return name != null
+            && !name.equals(".")
+            && !name.equals("..")
+            && name.matches("[\\p{L}\\p{N}._-]{1,220}");
+    }
+
+    private File safeArchiveTarget(File directory, String name) throws Exception {
+        File root = directory.getCanonicalFile();
+        File target = new File(root, name).getCanonicalFile();
+        if (!target.getPath().startsWith(root.getPath() + File.separator)) {
+            throw new SecurityException("备份包含越界文件路径");
+        }
+        return target;
+    }
+
+    private void commitStagedFiles(List<String[]> staged, File finalRoot) throws Exception {
+        for (String[] entry : staged) {
+            File directory = new File(finalRoot, entry[0]);
+            if (!directory.exists() && !directory.mkdirs()) throw new IllegalStateException("无法创建恢复目标目录");
+            File target = safeArchiveTarget(directory, entry[1]);
+            File source = new File(entry[2]);
+            try (InputStream input = new FileInputStream(source); FileOutputStream output = new FileOutputStream(target)) {
+                copyStream(input, output);
+            }
+            entry[2] = target.getAbsolutePath();
+        }
+    }
+
+    private int exportChatAttachments(ZipOutputStream zip, Set<Long> roleFilter) throws Exception {
+        File root = new File(getContext().getFilesDir(), "chat-attachments");
+        File[] roleDirectories = root.listFiles();
+        if (roleDirectories == null) return 0;
+        int exported = 0;
+        for (File roleDirectory : roleDirectories) {
+            long roleId;
+            try { roleId = Long.parseLong(roleDirectory.getName()); } catch (NumberFormatException ignored) { continue; }
+            if (!roleDirectory.isDirectory() || (roleFilter != null && !roleFilter.contains(roleId))) continue;
+            File[] files = roleDirectory.listFiles();
+            if (files == null) continue;
+            for (File file : files) {
+                if (!file.isFile() || !safeArchiveFileName(file.getName())) continue;
+                zip.putNextEntry(new ZipEntry("attachments/" + roleId + "/" + file.getName()));
+                try (InputStream input = new FileInputStream(file)) { copyStream(input, zip); }
+                zip.closeEntry();
+                exported += 1;
+            }
+        }
+        return exported;
     }
 
     private File mediaRoot() {
@@ -500,6 +639,8 @@ public class LargeMediaPlugin extends Plugin {
 
     private int importZipIntoLibrary(Uri source, File directory, long roleId) throws Exception {
         int imported = 0;
+        int entries = 0;
+        long totalBytes = 0;
         ContentResolver resolver = getContext().getContentResolver();
         InputStream rawInput = resolver.openInputStream(source);
         if (rawInput == null) throw new IllegalStateException("无法读取压缩包");
@@ -507,6 +648,8 @@ public class LargeMediaPlugin extends Plugin {
             ZipEntry entry;
             byte[] buffer = new byte[1024 * 1024];
             while ((entry = zip.getNextEntry()) != null) {
+                entries += 1;
+                if (entries > 10_000) throw new IllegalStateException("表情压缩包文件数超过安全限制");
                 if (entry.isDirectory()) { zip.closeEntry(); continue; }
                 String entryName = new File(entry.getName()).getName();
                 if (entryName.isEmpty() || !isSupportedImage(entryName, null)) { zip.closeEntry(); continue; }
@@ -515,7 +658,18 @@ public class LargeMediaPlugin extends Plugin {
                 File destination = new File(directory, UUID.randomUUID() + "--" + safeName);
                 try (FileOutputStream output = new FileOutputStream(destination)) {
                     int read;
-                    while ((read = zip.read(buffer)) != -1) output.write(buffer, 0, read);
+                    long entryBytes = 0;
+                    while ((read = zip.read(buffer)) != -1) {
+                        entryBytes += read;
+                        totalBytes += read;
+                        if (entryBytes > MAX_MEDIA_ENTRY_BYTES || totalBytes > 1024L * 1024 * 1024) {
+                            throw new IllegalStateException("表情压缩包解压大小超过安全限制");
+                        }
+                        output.write(buffer, 0, read);
+                    }
+                } catch (Exception error) {
+                    destination.delete();
+                    throw error;
                 }
                 mediaDatabase.insert(destination, roleId, nameWithoutExtension(entryName), mimeFromName(entryName));
                 imported += 1;

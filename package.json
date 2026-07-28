@@ -1,11 +1,15 @@
 {
   "name": "mchat2",
   "private": true,
-  "version": "0.14.0",
+  "version": "0.14.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "npm run build:android",
+    "typecheck": "tsc -b",
+    "lint": "eslint src",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run lint && npm run test && vite build",
     "build:ui": "tsc -b && vite build",
     "sync:android": "npm run build:ui && cap sync android",
     "build:android": "npm run sync:android && cd android && gradlew.bat assembleDebug",
@@ -27,8 +31,15 @@
   "devDependencies": {
     "@capacitor/assets": "^3.0.5",
     "@capacitor/cli": "^8.4.2",
+    "@eslint/js": "^10.0.1",
     "@types/react": "latest",
     "@types/react-dom": "latest",
-    "iconv-lite": "^0.7.3"
+    "eslint": "^10.8.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "fake-indexeddb": "^6.2.5",
+    "globals": "^17.8.0",
+    "iconv-lite": "^0.7.3",
+    "typescript-eslint": "^8.65.0",
+    "vitest": "^4.1.10"
   }
 }

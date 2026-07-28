@@ -10,7 +10,7 @@ export type TransitionDirection = 'forward' | 'back' | 'fade'
 
 export function runViewTransition(update: () => void, direction: TransitionDirection = 'fade') {
   const start = (document as TransitionDocument).startViewTransition
-  if (!start || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+  if (!start || document.querySelector('.app.reduce-motion') || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
     update()
     return
   }

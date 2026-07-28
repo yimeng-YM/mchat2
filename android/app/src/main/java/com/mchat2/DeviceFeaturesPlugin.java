@@ -8,6 +8,7 @@ import android.app.PendingIntent;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -15,6 +16,9 @@ import android.net.Uri;
 import android.os.Build;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
+import android.provider.Settings;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
 import android.speech.RecognizerIntent;
 
 import androidx.activity.result.ActivityResult;
@@ -36,10 +40,17 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyStore;
 import java.util.ArrayList;
 import android.util.Base64;
 import java.util.Locale;
 import java.util.UUID;
+
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
 
 @CapacitorPlugin(
     name = "DeviceFeatures",
@@ -49,6 +60,9 @@ import java.util.UUID;
 )
 public class DeviceFeaturesPlugin extends Plugin {
     private static final String NOTIFICATION_CHANNEL = "mchat2_replies";
+    private static final String NOTIFICATION_ROLE_EXTRA = "mchat2.notification.roleId";
+    private static final String SECRET_KEY_ALIAS = "mchat2.secure.settings";
+    private static final String SECRET_PREFERENCES = "mchat2_secure";
 
     @PluginMethod
     public void pickImage(PluginCall call) {
@@ -171,6 +185,26 @@ public class DeviceFeaturesPlugin extends Plugin {
         requestPermissionForAlias("notifications", call, "notificationPermissionResult");
     }
 
+    @PluginMethod
+    public void checkNotifications(PluginCall call) {
+        JSObject response = new JSObject();
+        response.put(
+            "granted",
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
+                || getPermissionState("notifications") == PermissionState.GRANTED
+        );
+        call.resolve(response);
+    }
+
+    @PluginMethod
+    public void openAppSettings(PluginCall call) {
+        Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+        intent.setData(Uri.fromParts("package", getContext().getPackageName(), null));
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        getContext().startActivity(intent);
+        call.resolve();
+    }
+
     @PermissionCallback
     private void notificationPermissionResult(PluginCall call) {
         JSObject response = new JSObject();
@@ -203,16 +237,22 @@ public class DeviceFeaturesPlugin extends Plugin {
             return;
         }
         NotificationManager manager = (NotificationManager) getContext().getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager == null) {
+            call.reject("系统通知服务不可用");
+            return;
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(NOTIFICATION_CHANNEL, "角色回复", NotificationManager.IMPORTANCE_DEFAULT);
             channel.setDescription("角色完成回复时的本地提醒");
             manager.createNotificationChannel(channel);
         }
+        long roleId = call.getLong("roleId", 0L);
         Intent launch = new Intent(getContext(), MainActivity.class);
         launch.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        launch.putExtra(NOTIFICATION_ROLE_EXTRA, roleId);
         PendingIntent pendingIntent = PendingIntent.getActivity(
             getContext(),
-            0,
+            notificationId(roleId),
             launch,
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
         );
@@ -239,8 +279,122 @@ public class DeviceFeaturesPlugin extends Plugin {
         } else {
             notification.setStyle(new NotificationCompat.BigTextStyle().bigText(call.getString("body", "收到一条新消息")));
         }
-        manager.notify(notificationId(call.getLong("roleId", 0L)), notification.build());
+        manager.notify(notificationId(roleId), notification.build());
         call.resolve();
+    }
+
+    @PluginMethod
+    public void getPendingNotificationOpen(PluginCall call) {
+        JSObject response = new JSObject();
+        Intent intent = getActivity() == null ? null : getActivity().getIntent();
+        long roleId = consumeNotificationRoleId(intent);
+        if (roleId > 0) response.put("roleId", roleId);
+        call.resolve(response);
+    }
+
+    @Override
+    protected void handleOnNewIntent(Intent intent) {
+        super.handleOnNewIntent(intent);
+        if (getActivity() != null) getActivity().setIntent(intent);
+        long roleId = consumeNotificationRoleId(intent);
+        if (roleId <= 0) return;
+        JSObject payload = new JSObject();
+        payload.put("roleId", roleId);
+        notifyListeners("notificationOpened", payload, true);
+    }
+
+    private long consumeNotificationRoleId(Intent intent) {
+        if (intent == null || !intent.hasExtra(NOTIFICATION_ROLE_EXTRA)) return 0L;
+        long roleId = intent.getLongExtra(NOTIFICATION_ROLE_EXTRA, 0L);
+        intent.removeExtra(NOTIFICATION_ROLE_EXTRA);
+        return roleId;
+    }
+
+    @PluginMethod
+    public void saveSecret(PluginCall call) {
+        String key = normalizedSecretKey(call.getString("key", ""));
+        String value = call.getString("value", "");
+        if (key == null) {
+            call.reject("无效的安全存储键");
+            return;
+        }
+        try {
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.ENCRYPT_MODE, secureStorageKey());
+            byte[] encrypted = cipher.doFinal(value.getBytes(StandardCharsets.UTF_8));
+            String encoded = Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP)
+                + ":"
+                + Base64.encodeToString(encrypted, Base64.NO_WRAP);
+            securePreferences().edit().putString(key, encoded).apply();
+            call.resolve();
+        } catch (Exception error) {
+            call.reject("无法保存安全设置", error);
+        }
+    }
+
+    @PluginMethod
+    public void loadSecret(PluginCall call) {
+        String key = normalizedSecretKey(call.getString("key", ""));
+        if (key == null) {
+            call.reject("无效的安全存储键");
+            return;
+        }
+        String encoded = securePreferences().getString(key, null);
+        JSObject response = new JSObject();
+        if (encoded == null || encoded.isEmpty()) {
+            call.resolve(response);
+            return;
+        }
+        try {
+            String[] parts = encoded.split(":", 2);
+            if (parts.length != 2) throw new IllegalStateException("安全设置格式损坏");
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                secureStorageKey(),
+                new GCMParameterSpec(128, Base64.decode(parts[0], Base64.DEFAULT))
+            );
+            byte[] plain = cipher.doFinal(Base64.decode(parts[1], Base64.DEFAULT));
+            response.put("value", new String(plain, StandardCharsets.UTF_8));
+            call.resolve(response);
+        } catch (Exception error) {
+            call.reject("无法读取安全设置", error);
+        }
+    }
+
+    @PluginMethod
+    public void clearSecret(PluginCall call) {
+        String key = normalizedSecretKey(call.getString("key", ""));
+        if (key == null) {
+            call.reject("无效的安全存储键");
+            return;
+        }
+        securePreferences().edit().remove(key).apply();
+        call.resolve();
+    }
+
+    private String normalizedSecretKey(String key) {
+        String normalized = key == null ? "" : key.trim();
+        return normalized.matches("[A-Za-z0-9._-]{1,80}") ? normalized : null;
+    }
+
+    private SharedPreferences securePreferences() {
+        return getContext().getSharedPreferences(SECRET_PREFERENCES, Context.MODE_PRIVATE);
+    }
+
+    private SecretKey secureStorageKey() throws Exception {
+        KeyStore keyStore = KeyStore.getInstance("AndroidKeyStore");
+        keyStore.load(null);
+        java.security.Key existing = keyStore.getKey(SECRET_KEY_ALIAS, null);
+        if (existing instanceof SecretKey) return (SecretKey) existing;
+        KeyGenerator generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore");
+        generator.init(new KeyGenParameterSpec.Builder(
+            SECRET_KEY_ALIAS,
+            KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT
+        ).setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .build());
+        return generator.generateKey();
     }
 
     @PluginMethod

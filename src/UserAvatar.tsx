@@ -1,4 +1,5 @@
 import { UserRound } from 'lucide-react'
+import { StoredImage } from './StoredImage'
 
 export function UserAvatar({ name, avatar, size = 'md' }: {
   name: string
@@ -8,6 +9,6 @@ export function UserAvatar({ name, avatar, size = 'md' }: {
   const label = `${name || '用户'}的头像`
 
   return <div className={`user-avatar user-avatar-${size}`} role="img" aria-label={label}>
-    {avatar ? <img src={avatar} alt="" /> : <UserRound aria-hidden="true" />}
+    {avatar ? <StoredImage source={avatar} alt="" /> : <UserRound aria-hidden="true" />}
   </div>
 }

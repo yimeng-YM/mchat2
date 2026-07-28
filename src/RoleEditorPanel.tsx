@@ -15,6 +15,8 @@ import {
 import type { Memory } from './chat-types'
 import { rangeProgressStyle } from './range-style'
 import { runViewTransition } from './view-transitions'
+import { persistUiAsset } from './asset-storage'
+import { StoredImage } from './StoredImage'
 
 export type EditableRole = {
   id: number
@@ -44,7 +46,7 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
   role: EditableRole
   isNew?: boolean
   onClose: () => void
-  onSave: (changes: EditableRole) => void
+  onSave: (changes: EditableRole) => Promise<void> | void
   onDelete?: () => Promise<void> | void
 }) {
   const [name, setName] = useState(role.name)
@@ -87,8 +89,29 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
 
   useEffect(() => { void refreshEmojis() }, [refreshEmojis])
 
-  const save = () => {
-    onSave({ ...role, name: name.trim() || role.name, avatar, signature: signature.trim(), persona: persona.trim(), background })
+  const save = async () => {
+    setBusy(true)
+    setNotice('')
+    try {
+      const [storedAvatar, storedBackground] = await Promise.all([
+        persistUiAsset(avatar, `role:${role.id}:avatar`),
+        background?.image
+          ? persistUiAsset(background.image, `role:${role.id}:background`)
+          : Promise.resolve(''),
+      ])
+      await onSave({
+        ...role,
+        name: name.trim() || role.name,
+        avatar: storedAvatar,
+        signature: signature.trim(),
+        persona: persona.trim(),
+        background: background && storedBackground ? { ...background, image: storedBackground } : background,
+      })
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '保存角色失败')
+    } finally {
+      setBusy(false)
+    }
   }
 
   const importEmojis = async (files?: File[]) => {
@@ -213,7 +236,7 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
   return <aside className="role-editor-panel">
     <header><div><span>角色编辑</span><small>直接影响当前对话</small></div><button className="icon-btn" onClick={onClose} aria-label="关闭角色编辑"><X /></button></header>
     <div className="role-editor-scroll">
-      <div className="role-editor-identity"><button className="role-editor-avatar" type="button" onClick={() => avatarInput.current?.click()} aria-label="更换角色头像"><img src={avatar} alt={name || role.name} /><span><Camera />更换</span></button><input ref={avatarInput} hidden type="file" accept="image/*" onChange={event => void importAvatar(event.target.files?.[0])} /><div><h2>{name || role.name}</h2><p>{signature || '写一句角色介绍'}</p></div></div>
+      <div className="role-editor-identity"><button className="role-editor-avatar" type="button" onClick={() => avatarInput.current?.click()} aria-label="更换角色头像"><StoredImage source={avatar} alt={name || role.name} /><span><Camera />更换</span></button><input ref={avatarInput} hidden type="file" accept="image/*" onChange={event => void importAvatar(event.target.files?.[0])} /><div><h2>{name || role.name}</h2><p>{signature || '写一句角色介绍'}</p></div></div>
       <label className="field"><span>角色名称</span><input value={name} onChange={event => setName(event.target.value)} /></label>
       <label className="field"><span>一句话介绍</span><input value={signature} onChange={event => setSignature(event.target.value)} maxLength={60} /><small>{signature.length} / 60</small></label>
       <div className="field prompt-field"><div className="prompt-label"><label htmlFor="role-prompt">角色提示词</label><button type="button" className="secondary compact import-action" onClick={() => promptInput.current?.click()}><FolderOpen />导入 TXT / MD</button></div><textarea id="role-prompt" rows={9} value={persona} onChange={event => setPersona(event.target.value)} placeholder="输入角色身份、说话方式、背景和行为规则…" /><input ref={promptInput} hidden type="file" accept=".txt,.md,text/plain,text/markdown" onChange={event => void importPrompt(event.target.files?.[0])} /></div>
@@ -223,8 +246,8 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
         <div className="role-background-heading"><div><h3>聊天背景</h3><p>手机端用于聊天，玻璃主题桌面端覆盖整页</p></div><button className="secondary compact import-action" onClick={() => backgroundInput.current?.click()}><Wallpaper />{background?.image ? '更换背景' : '导入背景'}</button><input ref={backgroundInput} hidden type="file" accept="image/*" onChange={event => importBackground(event.target.files?.[0])} /></div>
         {background?.image ? <div className="background-editor">
           <div className="background-preview">
-            <img className="background-preview-fill" src={background.image} alt="" style={{ filter: `blur(${Math.max(10, background.blur + 6)}px)` }} />
-            <img className="background-preview-focus" src={background.image} alt="聊天背景预览" style={{ filter: `blur(${background.blur}px)` }} />
+            <StoredImage className="background-preview-fill" source={background.image} alt="" style={{ filter: `blur(${Math.max(10, background.blur + 6)}px)` }} />
+            <StoredImage className="background-preview-focus" source={background.image} alt="聊天背景预览" style={{ filter: `blur(${background.blur}px)` }} />
             <i style={{ opacity: background.overlay / 100 }} />
             <b>桌面整页预览</b>
           </div>
@@ -303,7 +326,7 @@ export function RoleEditorPanel({ role, isNew = false, onClose, onSave, onDelete
         {memories.length > 0 && <button className="memory-clear-action" onClick={() => setClearMemoryConfirm(true)}><Trash2 />清空该角色全部记忆</button>}
       </section>
 </div>
-    <footer><span>{!isNew && onDelete && <button className="delete-role-action" onClick={() => runViewTransition(() => setDeleteConfirm(true))}><Trash2 />删除角色</button>}</span><button className="primary" onClick={save}><Save />保存修改</button></footer>
+    <footer><span>{!isNew && onDelete && <button className="delete-role-action" onClick={() => runViewTransition(() => setDeleteConfirm(true))}><Trash2 />删除角色</button>}</span><button className="primary" disabled={busy} onClick={() => void save()}><Save />保存修改</button></footer>
     {cropFile && <AvatarCropper file={cropFile} onCancel={() => runViewTransition(() => setCropFile(null))} onConfirm={result => runViewTransition(() => { setAvatar(result); setCropFile(null); setNotice('头像已裁切，保存修改后生效') })} />}
     {backgroundCropFile && <BackgroundCropper file={backgroundCropFile} onCancel={() => runViewTransition(() => setBackgroundCropFile(null))} onConfirm={image => runViewTransition(() => { setBackground({ image, blur: background?.blur ?? 0, overlay: background?.overlay ?? 28 }); setBackgroundCropFile(null); setNotice('聊天背景已裁切，保存修改后生效') })} />}
     {deleteConfirm && <ConfirmDialog title={`删除「${name || role.name}」？`} description="角色、对话记录、表情包和附件都会从本机删除，此操作不可撤销。" confirmLabel="删除角色" destructive onCancel={() => setDeleteConfirm(false)} onConfirm={() => { setDeleteConfirm(false); void Promise.resolve(onDelete?.()).then(onClose) }} />}
