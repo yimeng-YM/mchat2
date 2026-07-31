@@ -1,7 +1,7 @@
 {
   "name": "mchat2",
   "private": true,
-  "version": "0.14.4",
+  "version": "0.15.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,7 +12,9 @@
     "check": "npm run typecheck && npm run lint && npm run test && vite build",
     "build:ui": "tsc -b && vite build",
     "sync:android": "npm run build:ui && cap sync android",
-    "build:android": "npm run sync:android && cd android && gradlew.bat assembleDebug",
+    "lint:android": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android.ps1 -Task lintDebug",
+    "test:android": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android.ps1 -Task testDebugUnitTest",
+    "build:android": "npm run sync:android && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android.ps1 -Task assembleDebug",
     "open:android": "cap open android"
   },
   "dependencies": {
