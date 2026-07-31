@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!--
+      Users can configure arbitrary OpenAI-compatible services on their LAN, so
+      their private IP addresses cannot be enumerated ahead of time. API traffic
+      is sent through Capacitor's native HTTP client; WebView mixed content stays
+      disabled in capacitor.config.json.
+    -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
